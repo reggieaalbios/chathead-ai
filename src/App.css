@@ -1,0 +1,322 @@
+/* src/App.css - ChatHead AI: Glassmorphic Floating FAB */
+@import url('https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+
+:root {
+  --bg-glass: rgba(15, 17, 23, 0.75);
+  --bg-glass-heavy: rgba(15, 17, 23, 0.92);
+  --bg-surface: rgba(28, 32, 44, 0.6);
+  --bg-input: rgba(20, 23, 33, 0.8);
+
+  --border-color: rgba(255, 255, 255, 0.12);
+  --border-glow: rgba(138, 92, 246, 0.5);
+
+  --primary: #8a5cf6;
+  --primary-glow: rgba(138, 92, 246, 0.6);
+  --accent-cyan: #06b6d4;
+  --accent-cyan-glow: rgba(6, 182, 212, 0.5);
+  --text-main: #f8fafc;
+  --text-muted: #94a3b8;
+
+  font-family: 'Outfit', system-ui, -apple-system, sans-serif;
+  color: var(--text-main);
+  box-sizing: border-box;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+  user-select: none;
+}
+
+/* CRITICAL: Force full transparency on every layer */
+html, body, #root {
+  width: 100%;
+  height: 100%;
+  background: transparent !important;
+  background-color: transparent !important;
+  overflow: hidden;
+}
+
+/* =========================================================
+   APP CONTAINER — Fully transparent, holds FAB + dropdown
+   ========================================================= */
+.app-container {
+  width: 100vw;
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  padding: 2px;
+  background: transparent !important;
+}
+
+/* =========================================================
+   CIRCLE FAB (DRAGGABLE CHAT HEAD)
+   ========================================================= */
+.fab-wrapper {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+}
+
+.fab-button {
+  width: 64px;
+  height: 64px;
+  border-radius: 50%;
+  background: var(--bg-glass-heavy);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border: 1.5px solid var(--border-glow);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5), 0 0 20px rgba(138, 92, 246, 0.3);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+  color: var(--text-main);
+  position: relative;
+  overflow: visible;
+}
+
+.fab-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.fab-button:hover {
+  transform: scale(1.06);
+  border-color: var(--accent-cyan);
+  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.6), 0 0 30px var(--accent-cyan-glow);
+}
+
+.fab-button:active {
+  transform: scale(0.96);
+}
+
+/* Listening state animations */
+.fab-button.listening {
+  border-color: #ec4899;
+  box-shadow: 0 0 35px rgba(236, 72, 153, 0.7);
+  animation: pulse-fab 1.5s infinite ease-in-out;
+}
+
+.pulse-ring {
+  position: absolute;
+  width: 100%;
+  height: 100%;
+  border-radius: 50%;
+  border: 2px solid #ec4899;
+  opacity: 0;
+  pointer-events: none;
+  animation: ripple 2s infinite cubic-bezier(0, 0.2, 0.8, 1);
+}
+
+@keyframes ripple {
+  0% { transform: scale(1); opacity: 0.8; }
+  100% { transform: scale(2.2); opacity: 0; }
+}
+
+@keyframes pulse-fab {
+  0%, 100% { transform: scale(1); }
+  50% { transform: scale(1.05); }
+}
+
+/* =========================================================
+   DROPDOWN CONTAINER (QUAKE-STYLE OVERLAY CARD)
+   ========================================================= */
+.dropdown-card {
+  width: 100%;
+  flex: 1;
+  margin-top: 14px;
+  background: var(--bg-glass-heavy);
+  backdrop-filter: blur(24px);
+  -webkit-backdrop-filter: blur(24px);
+  border: 1px solid var(--border-color);
+  border-radius: 20px;
+  box-shadow: 0 20px 50px rgba(0, 0, 0, 0.6), 0 0 40px rgba(138, 92, 246, 0.15);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+
+  /* Smooth Quake-style Slide & Fade Animation */
+  animation: dropdown-in 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+  transform-origin: top right;
+}
+
+@keyframes dropdown-in {
+  from {
+    opacity: 0;
+    transform: translateY(-20px) scale(0.95);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+/* Card Header */
+.card-header {
+  padding: 14px 18px;
+  background: rgba(255, 255, 255, 0.03);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.header-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 600;
+  font-size: 14px;
+  letter-spacing: 0.3px;
+  color: #fff;
+}
+
+.status-pill {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  font-weight: 500;
+  padding: 3px 10px;
+  border-radius: 20px;
+  background: rgba(6, 182, 212, 0.15);
+  color: var(--accent-cyan);
+  border: 1px solid rgba(6, 182, 212, 0.3);
+}
+
+.status-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent-cyan);
+  box-shadow: 0 0 8px var(--accent-cyan);
+}
+
+/* Chat Messages Area */
+.chat-body {
+  flex: 1;
+  padding: 16px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255,255,255,0.1) transparent;
+}
+
+.chat-message {
+  max-width: 85%;
+  padding: 10px 14px;
+  border-radius: 14px;
+  font-size: 13.5px;
+  line-height: 1.5;
+  animation: message-in 0.25s ease-out;
+}
+
+@keyframes message-in {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.chat-message.ai {
+  align-self: flex-start;
+  background: var(--bg-surface);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-bottom-left-radius: 4px;
+  color: #e2e8f0;
+}
+
+.chat-message.user {
+  align-self: flex-end;
+  background: linear-gradient(135deg, var(--primary), #6d28d9);
+  color: #fff;
+  border-bottom-right-radius: 4px;
+  box-shadow: 0 4px 15px rgba(138, 92, 246, 0.3);
+}
+
+.chat-message code {
+  font-family: 'JetBrains Mono', monospace;
+  background: rgba(0, 0, 0, 0.3);
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-size: 12px;
+  color: #38bdf8;
+}
+
+/* Input Area */
+.chat-footer {
+  padding: 12px 14px;
+  background: rgba(0, 0, 0, 0.2);
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.input-container {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: var(--bg-input);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 12px;
+  padding: 6px 6px 6px 14px;
+  transition: border-color 0.2s, box-shadow 0.2s;
+}
+
+.input-container:focus-within {
+  border-color: var(--primary);
+  box-shadow: 0 0 15px rgba(138, 92, 246, 0.25);
+}
+
+.chat-input {
+  flex: 1;
+  background: transparent;
+  border: none;
+  color: #fff;
+  font-size: 13px;
+  font-family: inherit;
+  outline: none;
+}
+
+.chat-input::placeholder {
+  color: var(--text-muted);
+}
+
+.icon-btn {
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  width: 32px;
+  height: 32px;
+  border-radius: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.icon-btn:hover {
+  color: #fff;
+  background: rgba(255, 255, 255, 0.1);
+}
+
+.icon-btn.active {
+  color: #ec4899;
+  background: rgba(236, 72, 153, 0.15);
+}
+
+.send-btn {
+  background: linear-gradient(135deg, var(--primary), var(--accent-cyan));
+  color: #fff;
+}
+
+.send-btn:hover {
+  opacity: 0.9;
+  transform: scale(1.05);
+}
