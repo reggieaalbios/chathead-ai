@@ -1,0 +1,11 @@
+{
+  "inject-agents-md": {
+    "PreInvocation": [
+      {
+        "type": "command",
+        "command": "./hooks/inject-agents-md.sh",
+        "timeout": 15
+      }
+    ]
+  }
+}
