@@ -4,7 +4,7 @@
   "type": "module",
   "description": "AGS-based floating ChatHead AI overlay for Hyprland",
   "scripts": {
-    "start": "ags -b chathead-ai -c ./config.js",
+    "start": "ags -b chathead-ai -c \"$PWD/config.js\"",
     "stop": "ags -b chathead-ai -q"
   }
 }
