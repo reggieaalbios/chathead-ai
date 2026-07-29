@@ -38,9 +38,8 @@
    DROPDOWN CONTAINER (QUAKE-STYLE OVERLAY CARD)
    ========================================================= */
 .dropdown-card {
-    min-width: 360px;
+    min-width: 380px;
     min-height: 480px;
-    margin-top: 10px;
     background-color: rgba(15, 17, 23, 0.92);
     border: 1px solid rgba(255, 255, 255, 0.12);
     border-radius: 20px;
