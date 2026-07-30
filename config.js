@@ -3,6 +3,7 @@ import Widget from 'resource:///com/github/Aylur/ags/widget.js';
 import Variable from 'resource:///com/github/Aylur/ags/variable.js';
 import * as Utils from 'resource:///com/github/Aylur/ags/utils.js';
 import GtkLayerShell from 'gi://GtkLayerShell';
+import Hyprland from 'resource:///com/github/Aylur/ags/service/hyprland.js';
 
 const CSS = App.configDir + '/style.css';
 App.resetCss();
@@ -22,7 +23,7 @@ const screenH = Variable(1080);
 
 // Update screen bounds securely
 function updateScreenBounds() {
-    Utils.execAsync('hyprctl monitors -j').then(monitorOut => {
+    Hyprland.messageAsync('j/monitors').then(monitorOut => {
         const monitors = JSON.parse(monitorOut);
         const monitor = monitors.find(m => m.focused) || monitors[0];
         screenW.value = monitor.width / monitor.scale;
@@ -91,10 +92,9 @@ const ChatHead = () => {
                 
                 updateScreenBounds(); 
                 
-                // Query BOTH the cursor AND the actual compositor window position synchronously.
-                // This guarantees they use the exact same coordinate system (absolute screen pixels).
-                try {
-                    const pos = Utils.exec('hyprctl cursorpos').split(', ');
+                // Use async IPC instead of blocking process fork
+                Hyprland.messageAsync('cursorpos').then(currentOut => {
+                    const pos = currentOut.split(', ');
                     startX = parseInt(pos[0]);
                     startY = parseInt(pos[1]);
                     
@@ -105,47 +105,46 @@ const ChatHead = () => {
                     startFabY = fabY.value;
                     
                     console.log(`[DRAG_START] cursor=(${startX}, ${startY}) fabMargin=(${startFabX}, ${startFabY}) compositorPos=(${fabPos ? fabPos.x + ',' + fabPos.y : 'null'})`);
-                } catch (e) {
-                    console.error(e);
-                    return true;
-                }
-                
-                box._dragLoop = true;
-                let _firstPoll = true;
-                
-                // Self-scheduling sequential async loop
-                const pollCursor = () => {
-                    if (!box._dragLoop || !dragging) return;
                     
-                    Utils.execAsync('hyprctl cursorpos').then(currentOut => {
+                    box._dragLoop = true;
+                    let _firstPoll = true;
+                    
+                    // Self-scheduling sequential async loop
+                    const pollCursor = () => {
                         if (!box._dragLoop || !dragging) return;
                         
-                        const currentPos = currentOut.split(', ');
-                        const x = parseInt(currentPos[0]);
-                        const y = parseInt(currentPos[1]);
-                        
-                        let newFabX = startFabX + (x - startX);
-                        let newFabY = startFabY + (y - startY);
-                        
-                        // MATHEMATICAL CLAMPING: Prevent soft-lock by enforcing screen boundaries
-                        newFabX = Math.max(0, Math.min(newFabX, screenW.value - FAB_SIZE));
-                        newFabY = Math.max(0, Math.min(newFabY, screenH.value - FAB_SIZE));
-                        
-                        if (_firstPoll) {
-                            console.log(`[FIRST_POLL] cursor=(${x}, ${y}) delta=(${x - startX}, ${y - startY}) newFab=(${newFabX}, ${newFabY}) oldFab=(${fabX.value}, ${fabY.value})`);
-                            _firstPoll = false;
-                        }
-                        
-                        fabX.value = newFabX;
-                        fabY.value = newFabY;
-                        
-                        Utils.timeout(16, pollCursor);
-                    }).catch(e => {
-                        if (box._dragLoop && dragging) Utils.timeout(16, pollCursor);
-                    });
-                };
-                
-                pollCursor();
+                        Hyprland.messageAsync('cursorpos').then(currentOut => {
+                            if (!box._dragLoop || !dragging) return;
+                            
+                            const currentPos = currentOut.split(', ');
+                            const x = parseInt(currentPos[0]);
+                            const y = parseInt(currentPos[1]);
+                            
+                            let newFabX = startFabX + (x - startX);
+                            let newFabY = startFabY + (y - startY);
+                            
+                            // MATHEMATICAL CLAMPING: Prevent soft-lock by enforcing screen boundaries
+                            newFabX = Math.max(0, Math.min(newFabX, screenW.value - FAB_SIZE));
+                            newFabY = Math.max(0, Math.min(newFabY, screenH.value - FAB_SIZE));
+                            
+                            if (_firstPoll) {
+                                console.log(`[FIRST_POLL] cursor=(${x}, ${y}) delta=(${x - startX}, ${y - startY}) newFab=(${newFabX}, ${newFabY}) oldFab=(${fabX.value}, ${fabY.value})`);
+                                _firstPoll = false;
+                            }
+                            
+                            fabX.value = newFabX;
+                            fabY.value = newFabY;
+                            
+                            Utils.timeout(16, pollCursor);
+                        }).catch(e => {
+                            if (box._dragLoop && dragging) Utils.timeout(16, pollCursor);
+                        });
+                    };
+                    
+                    pollCursor();
+                }).catch(e => {
+                    console.error(e);
+                });
 
                 return true;
             });
@@ -157,7 +156,7 @@ const ChatHead = () => {
                 dragging = false;
                 box._dragLoop = false;
                 
-                Utils.execAsync('hyprctl cursorpos').then(out => {
+                Hyprland.messageAsync('cursorpos').then(out => {
                     const pos = out.split(', ');
                     const x = parseInt(pos[0]);
                     const y = parseInt(pos[1]);
@@ -172,26 +171,10 @@ const ChatHead = () => {
                             isOpen.value = false;
                         }
                     } else {
-                        // It was a drag, execute MAGNETIC EDGE SNAPPING
-                        const screenMid = screenW.value / 2;
-                        const targetX = fabX.value < screenMid ? 0 : (screenW.value - FAB_SIZE);
-                        
-                        let currentX = fabX.value;
-                        const animateSnap = () => {
-                            // Only animate if the user hasn't started dragging again
-                            if (dragging) return; 
-                            
-                            // Simple ease-out animation formula
-                            currentX += (targetX - currentX) * 0.25; 
-                            
-                            if (Math.abs(targetX - currentX) < 1) {
-                                fabX.value = targetX; // Snap exactly to target
-                            } else {
-                                fabX.value = Math.round(currentX);
-                                Utils.timeout(16, animateSnap);
-                            }
-                        };
-                        animateSnap();
+                        // It was a drag, just leave it where the user dropped it!
+                        // Clamp it to screen bounds to prevent it from going off-screen
+                        fabX.value = Math.max(0, Math.min(fabX.value, screenW.value - FAB_SIZE));
+                        fabY.value = Math.max(0, Math.min(fabY.value, screenH.value - FAB_SIZE));
                     }
                 }).catch(err => console.error(err));
                 
