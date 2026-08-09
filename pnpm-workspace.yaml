@@ -1,2 +1,6 @@
 allowBuilds:
+  # Electron's supported installer downloads the platform runtime used by dev mode.
+  electron: true
+  # Windows packaging is deferred; do not execute its transitive installer script.
+  electron-winstaller: false
   esbuild: true

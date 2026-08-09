@@ -1,10 +1,73 @@
 {
   "name": "chathead-ai",
   "version": "0.1.0",
+  "description": "Electron settings shell with a native Linux ChatHead sidecar",
+  "author": {
+    "name": "ReggieAlbiosA",
+    "email": "pureprogrammingph@gmail.com"
+  },
+  "desktopName": "io.github.chathead_ai.ChatHead",
+  "private": true,
   "type": "module",
-  "description": "AGS-based floating ChatHead AI overlay for Hyprland",
+  "main": "out/main/index.js",
+  "packageManager": "pnpm@11.10.0",
   "scripts": {
-    "start": "ags -b chathead-ai -c \"$PWD/config.js\"",
-    "stop": "ags -b chathead-ai -q"
+    "bootstrap": "./scripts/bootstrap-native.sh",
+    "dev": "./scripts/cargo-native.sh build -p chathead-linux && electron-vite dev",
+    "start": "electron-vite preview",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint electron.vite.config.ts vitest.config.ts src/main src/preload src/renderer src/shared",
+    "test": "vitest run",
+    "check": "pnpm typecheck && pnpm lint && pnpm test && cargo fmt --all --check && ./scripts/cargo-native.sh clippy --workspace --all-targets -- -D warnings && ./scripts/cargo-native.sh test --workspace",
+    "build": "./scripts/cargo-native.sh build -p chathead-linux --release && electron-vite build",
+    "dist:linux": "pnpm build && electron-builder --linux AppImage deb --x64",
+    "install:local": "./scripts/install-local.sh"
+  },
+  "dependencies": {
+    "lucide-react": "0.561.0",
+    "react": "19.2.8",
+    "react-dom": "19.2.8",
+    "zod": "4.4.3",
+    "zustand": "5.0.14"
+  },
+  "devDependencies": {
+    "@eslint/js": "9.39.2",
+    "@tailwindcss/vite": "4.3.3",
+    "@testing-library/jest-dom": "6.9.1",
+    "@testing-library/react": "16.3.2",
+    "@types/node": "25.3.3",
+    "@types/react": "19.2.14",
+    "@types/react-dom": "19.2.3",
+    "@vitejs/plugin-react": "5.1.4",
+    "electron": "43.3.0",
+    "electron-builder": "26.15.3",
+    "electron-vite": "5.0.0",
+    "eslint": "9.39.2",
+    "eslint-plugin-react-hooks": "7.0.1",
+    "eslint-plugin-react-refresh": "0.5.2",
+    "jsdom": "28.1.0",
+    "tailwindcss": "4.3.3",
+    "typescript": "5.9.3",
+    "typescript-eslint": "8.56.1",
+    "vite": "7.3.1",
+    "vitest": "4.1.0"
+  },
+  "build": {
+    "appId": "io.github.chathead_ai.ChatHead",
+    "productName": "ChatHead AI",
+    "asar": true,
+    "files": ["out/**/*", "package.json"],
+    "extraResources": [
+      { "from": "target/release/chathead-linux", "to": "sidecar/chathead-linux" },
+      { "from": ".local-native/lib", "to": "native/lib", "filter": ["libgtk4-layer-shell.so*"] },
+      { "from": "src/assets/provider/dark/image-Photoroom (7).png", "to": "provider-icon.png" }
+    ],
+    "linux": {
+      "target": ["AppImage", "deb"],
+      "category": "Utility",
+      "icon": "src/assets/provider/light/image-Photoroom (1).png",
+      "syncDesktopName": true,
+      "artifactName": "${productName}-${version}-${arch}.${ext}"
+    }
   }
 }

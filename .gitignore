@@ -8,8 +8,11 @@ pnpm-debug.log*
 lerna-debug.log*
 
 node_modules
+.local-native/
 dist
 dist-ssr
+out/
+release/
 *.local
 
 # Editor directories and files
@@ -24,5 +27,5 @@ dist-ssr
 *.sw?
 
 # Rust / Tauri
+target/
 src-tauri/target/
-src-tauri/Cargo.lock
