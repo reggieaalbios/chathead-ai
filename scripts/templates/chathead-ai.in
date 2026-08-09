@@ -1,0 +1,6 @@
+#!/bin/sh
+set -eu
+
+project_dir="@PROJECT_DIR@"
+export CHATHEAD_SIDECAR_PATH="$project_dir/target/release/chathead-linux"
+exec pnpm --dir "$project_dir" start "$@"

@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=ChatHead AI
+Comment=Wayland-native floating AI companion
+Exec=@EXEC@
+Terminal=false
+Categories=Utility;AI;
+StartupNotify=true
+StartupWMClass=ChatHead AI
