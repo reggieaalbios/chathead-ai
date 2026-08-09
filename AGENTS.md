@@ -1,7 +1,8 @@
 ## High Priority working agreements
  (Strictly acknowledge this rule below)
-- Use pnpm as default package manager.
-- verify our flow of discussion, plan, or implementation in the context of software engineering if it falls under deprecated, obsolete, legacy, or bad practices.. then stop and inform me. 
+- verify our flow of discussion, plan, or implementation in the context of software engineering if it falls under deprecation, obsolete, legacy, or bad practices.. then stop and inform me.
+  note: doesnt mean should only lean on modern software architecture and development.. it should use the modern stack but still has a support for legacy device, and technologies. 
+- use pnpm as default node package manager
 
 
 ## Prompt Flags
