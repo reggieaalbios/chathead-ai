@@ -6,9 +6,9 @@ declare global {
       backend: BackendApi
       window: { minimize(): void; close(): void }
       onUnavailable(callback: (message: string) => void): () => void
+      onShowSettings(callback: () => void): () => void
     }
   }
 }
 
 export {}
-

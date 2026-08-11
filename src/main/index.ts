@@ -1,6 +1,6 @@
 import { join } from 'node:path'
 import { app, BrowserWindow, ipcMain, Menu, nativeImage, session, shell, Tray } from 'electron'
-import type { BackendSnapshot, OverlayPosition, ProviderId, ResolvedAppearance } from '../shared/backend'
+import type { BackendSnapshot, PanelPosition, PanelSize, PanelZoom, ProviderId, ResolvedAppearance, VoiceInteractionMode, VoiceModelId, VoiceSubmissionMode } from '../shared/backend'
 import { SidecarManager } from './sidecar'
 import { approvedCodexLoginUrl } from './external'
 
@@ -16,6 +16,10 @@ const sidecar = new SidecarManager(
     const approved = approvedCodexLoginUrl(url)
     if (approved) void shell.openExternal(approved)
     else window?.webContents.send('backend:unavailable', 'Codex returned an unapproved authentication address.')
+  },
+  () => {
+    showWindow()
+    window?.webContents.send('window:showSettings')
   }
 )
 const gotLock = app.requestSingleInstanceLock()
@@ -31,6 +35,9 @@ app.whenReady().then(async () => {
     window?.webContents.send('backend:snapshotChanged', snapshot)
     refreshTrayMenu()
   })
+  sidecar.onVoiceLevelChanged((level) => window?.webContents.send('backend:voiceLevelChanged', level))
+  sidecar.onPanelZoomChanged((zoom) => window?.webContents.send('backend:panelZoomChanged', zoom))
+  sidecar.onPanelSizeChanged((size) => window?.webContents.send('backend:panelSizeChanged', size))
   registerIpc()
   try { await sidecar.start() } catch (error) { window?.webContents.send('backend:unavailable', error instanceof Error ? error.message : String(error)) }
 })
@@ -99,7 +106,21 @@ function registerIpc(): void {
   ipcMain.handle('backend:launchOverlay', () => sidecar.launchOverlay())
   ipcMain.handle('backend:stopOverlay', () => sidecar.stopOverlay())
   ipcMain.handle('backend:setOverlayTheme', (_event, theme: ResolvedAppearance) => sidecar.setOverlayTheme(theme))
-  ipcMain.handle('backend:setOverlayPosition', (_event, position: OverlayPosition) => sidecar.setOverlayPosition(position))
+  ipcMain.handle('backend:setPanelPosition', (_event, position: PanelPosition) => sidecar.setPanelPosition(position))
+  ipcMain.handle('backend:setPanelZoom', (_event, zoom: PanelZoom) => sidecar.setPanelZoom(zoom))
+  ipcMain.handle('backend:setPanelSize', (_event, size: PanelSize) => sidecar.setPanelSize(size))
+  ipcMain.handle('backend:setVoiceEnabled', (_event, enabled: boolean) => sidecar.setVoiceEnabled(enabled))
+  ipcMain.handle('backend:setVoiceInputDevice', (_event, deviceId?: string) => sidecar.setVoiceInputDevice(deviceId))
+  ipcMain.handle('backend:setVoiceInteractionMode', (_event, mode: VoiceInteractionMode) => sidecar.setVoiceInteractionMode(mode))
+  ipcMain.handle('backend:setVoiceSubmissionMode', (_event, mode: VoiceSubmissionMode) => sidecar.setVoiceSubmissionMode(mode))
+  ipcMain.handle('backend:refreshVoiceDevices', () => sidecar.refreshVoiceDevices())
+  ipcMain.handle('backend:retryVoiceSetup', () => sidecar.retryVoiceSetup())
+  ipcMain.handle('backend:setVoiceModel', (_event, modelId: VoiceModelId) => sidecar.setVoiceModel(modelId))
+  ipcMain.handle('backend:downloadVoiceModel', (_event, modelId: VoiceModelId) => sidecar.downloadVoiceModel(modelId))
+  ipcMain.handle('backend:cancelVoiceModelDownload', (_event, modelId: VoiceModelId) => sidecar.cancelVoiceModelDownload(modelId))
+  ipcMain.handle('backend:removeVoiceModel', (_event, modelId: VoiceModelId) => sidecar.removeVoiceModel(modelId))
+  ipcMain.handle('backend:startVoiceTest', () => sidecar.startVoiceTest())
+  ipcMain.handle('backend:stopVoiceTest', () => sidecar.stopVoiceTest())
   ipcMain.handle('backend:shutdown', () => sidecar.shutdown())
   ipcMain.on('window:minimize', () => window?.minimize())
   ipcMain.on('window:close', () => window?.hide())

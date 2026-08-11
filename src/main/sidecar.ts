@@ -3,7 +3,7 @@ import { createInterface } from 'node:readline'
 import { join } from 'node:path'
 import { app } from 'electron'
 import { z } from 'zod'
-import { PROTOCOL_VERSION, type BackendSnapshot, type OverlayPosition, type ProviderId, type ResolvedAppearance } from '../shared/backend'
+import { PROTOCOL_VERSION, backendSnapshotSchema, defaultPanelSize, panelSizeSchema, panelZoomSchema, type BackendSnapshot, type PanelPosition, type PanelSize, type PanelZoom, type ProviderId, type ResolvedAppearance, type VoiceInteractionMode, type VoiceModelId, type VoiceSubmissionMode } from '../shared/backend'
 
 const ipcErrorSchema = z.object({ code: z.string(), message: z.string(), recoverable: z.boolean() })
 const messageSchema = z.object({ protocolVersion: z.number() }).passthrough()
@@ -15,6 +15,9 @@ export class SidecarManager {
   private child: ChildProcessWithoutNullStreams | undefined
   private pending = new Map<string, Pending>()
   private listeners = new Set<(snapshot: BackendSnapshot) => void>()
+  private voiceLevelListeners = new Set<(level: number) => void>()
+  private panelZoomListeners = new Set<(zoom: PanelZoom) => void>()
+  private panelSizeListeners = new Set<(size: PanelSize) => void>()
   private sequence = 0
   private restartCount = 0
   private intentionallyStopping = false
@@ -22,11 +25,14 @@ export class SidecarManager {
   private resolveReady: (() => void) | undefined
   private rejectReady: ((reason: Error) => void) | undefined
   private overlayTheme: ResolvedAppearance = 'light'
-  private overlayPosition: OverlayPosition = 'left'
+  private panelPosition: PanelPosition = 'right'
+  private panelZoom: PanelZoom = 100
+  private panelSize: PanelSize = defaultPanelSize
 
   constructor(
     private readonly onUnavailable: (message: string) => void,
-    private readonly onOpenExternal: (purpose: 'codexLogin', url: string) => void
+    private readonly onOpenExternal: (purpose: 'codexLogin', url: string) => void,
+    private readonly onOpenSettings: () => void
   ) {}
 
   async start(): Promise<void> {
@@ -55,7 +61,9 @@ export class SidecarManager {
         new Promise<never>((_, reject) => setTimeout(() => reject(new Error('sidecar handshake timed out')), 5_000))
       ])
       await this.request('setOverlayTheme', { theme: this.overlayTheme })
-      await this.request('setOverlayPosition', { position: this.overlayPosition })
+      await this.request('setPanelPosition', { position: this.panelPosition })
+      await this.request('setPanelZoom', { zoom: this.panelZoom })
+      await this.request('setPanelSize', { size: this.panelSize })
     } catch (error) {
       this.child?.kill('SIGTERM')
       throw error
@@ -65,6 +73,21 @@ export class SidecarManager {
   onSnapshotChanged(callback: (snapshot: BackendSnapshot) => void): () => void {
     this.listeners.add(callback)
     return () => this.listeners.delete(callback)
+  }
+
+  onVoiceLevelChanged(callback: (level: number) => void): () => void {
+    this.voiceLevelListeners.add(callback)
+    return () => this.voiceLevelListeners.delete(callback)
+  }
+
+  onPanelZoomChanged(callback: (zoom: PanelZoom) => void): () => void {
+    this.panelZoomListeners.add(callback)
+    return () => this.panelZoomListeners.delete(callback)
+  }
+
+  onPanelSizeChanged(callback: (size: PanelSize) => void): () => void {
+    this.panelSizeListeners.add(callback)
+    return () => this.panelSizeListeners.delete(callback)
   }
 
   getSnapshot = (): Promise<BackendSnapshot> => this.request('getSnapshot')
@@ -77,10 +100,32 @@ export class SidecarManager {
     this.overlayTheme = theme
     return this.request('setOverlayTheme', { theme })
   }
-  setOverlayPosition = (position: OverlayPosition): Promise<BackendSnapshot> => {
-    this.overlayPosition = position
-    return this.request('setOverlayPosition', { position })
+  setPanelPosition = (position: PanelPosition): Promise<BackendSnapshot> => {
+    this.panelPosition = position
+    return this.request('setPanelPosition', { position })
   }
+  setPanelZoom = (zoom: PanelZoom): Promise<BackendSnapshot> => {
+    const parsedZoom = panelZoomSchema.parse(zoom)
+    this.panelZoom = parsedZoom
+    return this.request('setPanelZoom', { zoom: parsedZoom })
+  }
+  setPanelSize = (size: PanelSize): Promise<BackendSnapshot> => {
+    const parsedSize = panelSizeSchema.parse(size)
+    this.panelSize = parsedSize
+    return this.request('setPanelSize', { size: parsedSize })
+  }
+  setVoiceEnabled = (enabled: boolean): Promise<BackendSnapshot> => this.request('setVoiceEnabled', { enabled })
+  setVoiceInputDevice = (deviceId?: string): Promise<BackendSnapshot> => this.request('setVoiceInputDevice', { deviceId })
+  setVoiceInteractionMode = (mode: VoiceInteractionMode): Promise<BackendSnapshot> => this.request('setVoiceInteractionMode', { mode })
+  setVoiceSubmissionMode = (mode: VoiceSubmissionMode): Promise<BackendSnapshot> => this.request('setVoiceSubmissionMode', { mode })
+  refreshVoiceDevices = (): Promise<BackendSnapshot> => this.request('refreshVoiceDevices')
+  retryVoiceSetup = (): Promise<BackendSnapshot> => this.request('retryVoiceSetup')
+  setVoiceModel = (modelId: VoiceModelId): Promise<BackendSnapshot> => this.request('setVoiceModel', { modelId })
+  downloadVoiceModel = (modelId: VoiceModelId): Promise<BackendSnapshot> => this.request('downloadVoiceModel', { modelId })
+  cancelVoiceModelDownload = (modelId: VoiceModelId): Promise<BackendSnapshot> => this.request('cancelVoiceModelDownload', { modelId })
+  removeVoiceModel = (modelId: VoiceModelId): Promise<BackendSnapshot> => this.request('removeVoiceModel', { modelId })
+  startVoiceTest = (): Promise<BackendSnapshot> => this.request('startVoiceTest')
+  stopVoiceTest = (): Promise<BackendSnapshot> => this.request('stopVoiceTest')
 
   async shutdown(): Promise<void> {
     this.intentionallyStopping = true
@@ -117,16 +162,52 @@ export class SidecarManager {
     }
     const message = parsed.data as Record<string, unknown>
     if (message.event === 'ready') {
+      const snapshot = backendSnapshotSchema.safeParse(message.payload)
+      if (!snapshot.success) {
+        const error = new Error('PROTOCOL_MISMATCH: native sidecar returned an invalid ready snapshot')
+        this.rejectReady?.(error)
+        this.resolveReady = undefined
+        this.rejectReady = undefined
+        this.onUnavailable(error.message)
+        return
+      }
+      this.emit(snapshot.data)
       this.resolveReady?.()
       this.resolveReady = undefined
       this.rejectReady = undefined
-      if (message.payload) this.emit(message.payload as BackendSnapshot)
       return
     }
-    if (message.event === 'snapshotChanged' && message.payload) { this.emit(message.payload as BackendSnapshot); return }
+    if (message.event === 'snapshotChanged' && message.payload) {
+      const snapshot = backendSnapshotSchema.safeParse(message.payload)
+      if (snapshot.success) this.emit(snapshot.data)
+      else this.onUnavailable('The native sidecar returned an invalid snapshot.')
+      return
+    }
     if (message.event === 'openExternal') {
       const payload = message.payload as { purpose?: unknown; url?: unknown } | undefined
       if (payload?.purpose === 'codexLogin' && typeof payload.url === 'string') this.onOpenExternal('codexLogin', payload.url)
+      return
+    }
+    if (message.event === 'openSettings') { this.onOpenSettings(); return }
+    if (message.event === 'voiceLevelChanged') {
+      const payload = message.payload as { level?: unknown } | undefined
+      if (typeof payload?.level === 'number') for (const listener of this.voiceLevelListeners) listener(payload.level)
+      return
+    }
+    if (message.event === 'panelZoomChanged') {
+      const parsedZoom = panelZoomSchema.safeParse(message.payload)
+      if (parsedZoom.success && parsedZoom.data !== this.panelZoom) {
+        this.panelZoom = parsedZoom.data
+        for (const listener of this.panelZoomListeners) listener(parsedZoom.data)
+      }
+      return
+    }
+    if (message.event === 'panelSizeChanged') {
+      const parsedSize = panelSizeSchema.safeParse(message.payload)
+      if (parsedSize.success && (parsedSize.data.width !== this.panelSize.width || parsedSize.data.height !== this.panelSize.height)) {
+        this.panelSize = parsedSize.data
+        for (const listener of this.panelSizeListeners) listener(parsedSize.data)
+      }
       return
     }
     if (typeof message.id !== 'string') return
@@ -138,7 +219,9 @@ export class SidecarManager {
       const error = ipcErrorSchema.parse(message.error)
       pending.reject(Object.assign(new Error(error.message), error))
     } else {
-      pending.resolve(message.result as BackendSnapshot)
+      const snapshot = backendSnapshotSchema.safeParse(message.result)
+      if (snapshot.success) pending.resolve(snapshot.data)
+      else pending.reject(new Error('PROTOCOL_MISMATCH: native sidecar returned an invalid result snapshot'))
     }
   }
 
