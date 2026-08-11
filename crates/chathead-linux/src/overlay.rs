@@ -4,7 +4,7 @@ use std::{
     cell::{Cell, RefCell},
     rc::Rc,
     sync::{
-        atomic::{AtomicU8, Ordering},
+        atomic::{AtomicU8, AtomicU16, Ordering},
         mpsc,
     },
     thread,
@@ -17,32 +17,84 @@ use ashpd::desktop::{
 };
 use chathead_core::{
     ChatMessage, CodexAppServer, CodexCommand, CodexEvent, Conversation, ExperimentalChatSnapshot,
-    ExperimentalChatState, MessageRole, MessageState,
+    ExperimentalChatState, IpcEvent, MessageRole, MessageState, PANEL_HEIGHT_DEFAULT,
+    PANEL_HEIGHT_MAX, PANEL_HEIGHT_MIN, PANEL_WIDTH_DEFAULT, PANEL_WIDTH_MAX, PANEL_WIDTH_MIN,
+    PROTOCOL_VERSION, PanelSize, PanelZoom, ShortcutStatus as ProtocolShortcutStatus, VoicePhase,
+    VoiceSnapshot, VoiceSubmissionMode,
 };
+use chathead_voice::{VoiceEvent, VoiceService};
 use futures_util::StreamExt;
 use gtk::{cairo, gdk, glib, prelude::*};
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 use serde::Deserialize;
 
+use crate::response_view::{
+    AssistantDocument, DocumentTheme, HighlightWorker, LinkHandler, RetryHandler,
+    copy_text_to_clipboard, open_confirmed_uri,
+};
+
 const VOICE_TOGGLE_ID: &str = "voice_toggle";
-const VOICE_TOGGLE_TRIGGER: &str = "LOGO+SHIFT+v";
-const VOICE_TOGGLE_LABEL: &str = "Super+Shift+V";
+const VOICE_TOGGLE_TRIGGER: &str = "LOGO+e";
+const VOICE_TOGGLE_LABEL: &str = "Super+E";
+const PANEL_TOGGLE_ID: &str = "panel_toggle";
+const PANEL_TOGGLE_TRIGGER: &str = "LOGO+w";
+const PANEL_TOGGLE_LABEL: &str = "Super+W";
 const CHATHEAD_SIZE: i32 = 84;
-const PANEL_WIDTH: i32 = 560;
-const PANEL_HEIGHT: i32 = 460;
 const PANEL_GAP: i32 = 10;
-const EDGE_PADDING: i32 = 12;
+const EDGE_PADDING: i32 = 16;
+const RESIZE_EDGE_HIT_ZONE: f64 = 12.0;
+const RESIZE_CORNER_HIT_ZONE: f64 = 24.0;
 const CLICK_THRESHOLD: f64 = 5.0;
 const ACTION_POLL_MS: u64 = 40;
 const ANIMATION_FRAME_MS: u64 = 33;
-const SHORTCUT_DEBOUNCE_MS: u64 = 450;
+const STREAM_RENDER_INTERVAL_MS: u64 = 33;
+const VOICE_SEND_DELAY: Duration = Duration::from_millis(700);
 const WAKE_ANIMATION_SECONDS: f64 = 0.36;
 static ORB_THEME: AtomicU8 = AtomicU8::new(0);
-static OVERLAY_POSITION: AtomicU8 = AtomicU8::new(0);
+static PANEL_POSITION: AtomicU8 = AtomicU8::new(1);
+static PANEL_ZOOM: AtomicU8 = AtomicU8::new(100);
+static PANEL_WIDTH: AtomicU16 = AtomicU16::new(PANEL_WIDTH_DEFAULT);
+static PANEL_HEIGHT: AtomicU16 = AtomicU16::new(PANEL_HEIGHT_DEFAULT);
 
 thread_local! {
+    static PANEL_ZOOM_CSS: RefCell<Option<gtk::CssProvider>> = const { RefCell::new(None) };
     static PANEL_RUNTIME: RefCell<Option<PanelRuntime>> = const { RefCell::new(None) };
-    static POSITION_RUNTIME: RefCell<Option<PositionRuntime>> = const { RefCell::new(None) };
+    static OVERLAY_RUNTIME: RefCell<Option<OverlayRuntime>> = const { RefCell::new(None) };
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PanelMetrics {
+    panel_padding: i32,
+    panel_spacing: i32,
+    row_spacing: i32,
+    transcript_spacing: i32,
+    composer_height: i32,
+    composer_view_height: i32,
+    compact_target: i32,
+    send_target: i32,
+    title_font: i32,
+    body_font: i32,
+    small_font: i32,
+}
+
+impl PanelMetrics {
+    fn for_zoom(zoom: PanelZoom) -> Self {
+        let scale = f64::from(zoom.value()) / 100.0;
+        let scaled = |base: i32| (f64::from(base) * scale).round() as i32;
+        Self {
+            panel_padding: scaled(14),
+            panel_spacing: scaled(12).max(8),
+            row_spacing: scaled(8).max(6),
+            transcript_spacing: scaled(18).max(12),
+            composer_height: scaled(46).max(36),
+            composer_view_height: scaled(42).max(32),
+            compact_target: scaled(28).max(28),
+            send_target: scaled(36).max(28),
+            title_font: scaled(14).max(10),
+            body_font: scaled(13).max(10),
+            small_font: scaled(10).max(10),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
@@ -71,12 +123,12 @@ impl OrbTheme {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "lowercase")]
-pub(crate) enum OverlayPosition {
+pub(crate) enum PanelPosition {
     Left,
     Right,
 }
 
-impl OverlayPosition {
+impl PanelPosition {
     const fn value(self) -> u8 {
         match self {
             Self::Left => 0,
@@ -84,8 +136,15 @@ impl OverlayPosition {
         }
     }
 
+    const fn opposite(self) -> Self {
+        match self {
+            Self::Left => Self::Right,
+            Self::Right => Self::Left,
+        }
+    }
+
     fn current() -> Self {
-        if OVERLAY_POSITION.load(Ordering::Relaxed) == Self::Right.value() {
+        if PANEL_POSITION.load(Ordering::Relaxed) == Self::Right.value() {
             Self::Right
         } else {
             Self::Left
@@ -106,15 +165,101 @@ pub(crate) fn set_native_overlay_theme(app: &gtk::Application, theme: OrbTheme) 
             queue_chathead_draw(&root);
         }
     }
-}
-
-pub(crate) fn set_native_overlay_position(position: OverlayPosition) {
-    OVERLAY_POSITION.store(position.value(), Ordering::Relaxed);
-    POSITION_RUNTIME.with(|stored| {
+    PANEL_RUNTIME.with(|stored| {
         if let Some(runtime) = stored.borrow().as_ref() {
-            apply_preferred_position(runtime, position);
+            let anchor = TranscriptAnchor::capture(&runtime.widgets.transcript_scroll);
+            for rendered in runtime.rendered_messages.borrow().iter() {
+                if let Some(document) = &rendered.document {
+                    document.update(
+                        &rendered.rendered_text,
+                        rendered.rendered_state,
+                        theme.into(),
+                    );
+                }
+            }
+            let adjustment = runtime.widgets.transcript_scroll.vadjustment();
+            glib::idle_add_local_once(move || anchor.restore(&adjustment));
         }
     });
+}
+
+impl From<OrbTheme> for DocumentTheme {
+    fn from(theme: OrbTheme) -> Self {
+        match theme {
+            OrbTheme::Light => Self::Light,
+            OrbTheme::Dark => Self::Dark,
+        }
+    }
+}
+
+pub(crate) fn set_native_panel_position(position: PanelPosition) {
+    PANEL_POSITION.store(position.value(), Ordering::Relaxed);
+    OVERLAY_RUNTIME.with(|stored| {
+        if let Some(runtime) = stored.borrow().as_ref() {
+            runtime.state.panel_rect_override.set(None);
+            apply_panel_position(runtime);
+        }
+    });
+}
+
+pub(crate) fn set_native_panel_zoom(zoom: PanelZoom) {
+    let zoom_value = u8::try_from(zoom.value()).expect("validated panel zoom fits in u8");
+    let previous = PANEL_ZOOM.swap(zoom_value, Ordering::Relaxed);
+    if previous == zoom_value {
+        update_panel_zoom_css(zoom);
+        return;
+    }
+    PANEL_RUNTIME.with(|stored| {
+        if let Some(runtime) = stored.borrow().as_ref() {
+            apply_panel_metrics(runtime, zoom);
+        }
+    });
+    update_panel_zoom_css(zoom);
+}
+
+fn current_panel_zoom() -> PanelZoom {
+    PanelZoom::try_from(u16::from(PANEL_ZOOM.load(Ordering::Relaxed))).unwrap_or(PanelZoom::DEFAULT)
+}
+
+pub(crate) fn set_native_panel_size(size: PanelSize) {
+    if size == current_panel_size() {
+        return;
+    }
+    store_panel_size(size);
+    OVERLAY_RUNTIME.with(|stored| {
+        if let Some(runtime) = stored.borrow().as_ref() {
+            let effective = effective_panel_size(
+                size,
+                runtime.canvas.allocated_width(),
+                runtime.canvas.allocated_height(),
+            );
+            store_panel_size(effective);
+            runtime.state.panel_size.set(effective);
+            runtime.state.panel_rect_override.set(None);
+            PANEL_RUNTIME.with(|panel_stored| {
+                if let Some(panel_runtime) = panel_stored.borrow().as_ref() {
+                    apply_panel_dimensions(panel_runtime, effective);
+                }
+            });
+            apply_panel_position(runtime);
+            if effective != size {
+                emit_panel_size_changed(effective);
+            }
+        }
+    });
+}
+
+fn current_panel_size() -> PanelSize {
+    PanelSize::try_new(
+        PANEL_WIDTH.load(Ordering::Relaxed),
+        PANEL_HEIGHT.load(Ordering::Relaxed),
+    )
+    .unwrap_or_default()
+}
+
+fn store_panel_size(size: PanelSize) {
+    PANEL_WIDTH.store(size.width(), Ordering::Relaxed);
+    PANEL_HEIGHT.store(size.height(), Ordering::Relaxed);
 }
 
 fn queue_chathead_draw(widget: &gtk::Widget) {
@@ -138,7 +283,86 @@ pub(crate) fn load_native_css() {
             &provider,
             gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
         );
+        let zoom_provider = gtk::CssProvider::new();
+        gtk::style_context_add_provider_for_display(
+            &display,
+            &zoom_provider,
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION + 1,
+        );
+        PANEL_ZOOM_CSS.with(|stored| stored.replace(Some(zoom_provider)));
+        update_panel_zoom_css(current_panel_zoom());
     }
+}
+
+fn update_panel_zoom_css(zoom: PanelZoom) {
+    let metrics = PanelMetrics::for_zoom(zoom);
+    let scale = f64::from(zoom.value()) / 100.0;
+    let px = |base: i32| ((f64::from(base) * scale).round() as i32).max(10);
+    let css = format!(
+        ".chat-panel {{ padding: {}px; }}\n\
+         .chat-panel .panel-title {{ font-size: {}px; }}\n\
+         .chat-panel .provider-status, .chat-panel .voice-message {{ font-size: {}px; }}\n\
+         .chat-panel .thinking-label, .chat-panel .chat-failure, .chat-panel .prompt-placeholder {{ font-size: {}px; }}\n\
+         .chat-panel .chat-info {{ font-size: {}px; }}\n\
+         .chat-panel .chat-bubble {{ padding: {}px {}px; border-radius: {}px; font-size: {}px; }}\n\
+         .chat-panel .thinking-bubble {{ padding: {}px {}px; }}\n\
+         .chat-panel .thinking-dot {{ font-size: {}px; }}\n\
+         .chat-panel .response-paragraph, .chat-panel .response-table label, .chat-panel .response-list label, .chat-panel .response-quote label, .chat-panel .response-footnote label, .chat-panel .definition-list label {{ font-size: {}px; }}\n\
+         .chat-panel .response-h1 {{ font-size: {}px; }}\n\
+         .chat-panel .response-h2 {{ font-size: {}px; }}\n\
+         .chat-panel .response-h3 {{ font-size: {}px; }}\n\
+         .chat-panel .response-h4, .chat-panel .response-h5, .chat-panel .response-h6 {{ font-size: {}px; }}\n\
+         .chat-panel .code-content, .chat-panel .code-language {{ font-size: {}px; }}\n\
+         .chat-panel .assistant-document > box > label, .chat-panel .assistant-document > box > box, .chat-panel .assistant-document > box > scrolledwindow, .chat-panel .assistant-document > box > separator {{ margin-bottom: {}px; }}\n\
+         .chat-panel .composer-bar {{ min-height: {}px; padding: {}px; border-radius: {}px; }}\n\
+         .chat-panel .prompt-frame {{ min-height: {}px; }}\n\
+         .chat-panel .prompt-input, .chat-panel .prompt-input text {{ min-height: {}px; padding: {}px {}px; font-size: {}px; }}\n\
+         .chat-panel .new-chat {{ min-width: {}px; min-height: {}px; font-size: {}px; }}\n\
+         .chat-panel .send-button {{ min-width: {}px; min-height: {}px; font-size: {}px; }}\n\
+         .chat-panel button:not(.new-chat):not(.send-button):not(.response-action) {{ min-height: {}px; padding-left: {}px; padding-right: {}px; font-size: {}px; }}",
+        metrics.panel_padding,
+        metrics.title_font,
+        metrics.small_font,
+        px(11),
+        px(12),
+        (9.0 * scale).round() as i32,
+        (11.0 * scale).round() as i32,
+        (8.0 * scale).round() as i32,
+        metrics.body_font,
+        (7.0 * scale).round() as i32,
+        (10.0 * scale).round() as i32,
+        metrics.small_font,
+        px(14),
+        px(18),
+        px(16),
+        px(15),
+        px(14),
+        px(12),
+        (10.0 * scale).round() as i32,
+        metrics.composer_height,
+        (5.0 * scale).round() as i32,
+        (11.0 * scale).round() as i32,
+        metrics.composer_height - 2,
+        metrics.composer_view_height,
+        (5.0 * scale).round() as i32,
+        (6.0 * scale).round() as i32,
+        metrics.body_font,
+        metrics.compact_target,
+        metrics.compact_target,
+        px(15),
+        metrics.send_target,
+        metrics.send_target,
+        px(14),
+        metrics.compact_target,
+        (8.0 * scale).round() as i32,
+        (8.0 * scale).round() as i32,
+        px(11),
+    );
+    PANEL_ZOOM_CSS.with(|stored| {
+        if let Some(provider) = stored.borrow().as_ref() {
+            provider.load_from_data(&css);
+        }
+    });
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -148,9 +372,22 @@ enum VoiceState {
 }
 
 enum AppEvent {
-    StopVoice,
-    ToggleVoice,
-    ShortcutStatus(ShortcutStatus),
+    CancelVoice,
+    VoiceShortcutActivated,
+    VoiceShortcutDeactivated,
+    TogglePanel,
+    ShortcutStatus(ShortcutAction, ShortcutStatus),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ShortcutAction {
+    Voice,
+    Panel,
+}
+
+pub(crate) struct ShortcutStatusUpdate {
+    pub(crate) action: ShortcutAction,
+    pub(crate) status: ProtocolShortcutStatus,
 }
 
 #[derive(Clone)]
@@ -161,6 +398,67 @@ enum ShortcutStatus {
     Unavailable(String),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct PanelRect {
+    x: f64,
+    y: f64,
+    width: i32,
+    height: i32,
+}
+
+impl PanelRect {
+    fn size(self) -> PanelSize {
+        PanelSize::try_new(
+            u16::try_from(self.width).expect("bounded panel width fits in u16"),
+            u16::try_from(self.height).expect("bounded panel height fits in u16"),
+        )
+        .expect("panel rectangle is always bounded")
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ResizeEdge {
+    North,
+    NorthEast,
+    East,
+    SouthEast,
+    South,
+    SouthWest,
+    West,
+    NorthWest,
+}
+
+impl ResizeEdge {
+    const fn moves_left(self) -> bool {
+        matches!(self, Self::West | Self::NorthWest | Self::SouthWest)
+    }
+
+    const fn moves_right(self) -> bool {
+        matches!(self, Self::East | Self::NorthEast | Self::SouthEast)
+    }
+
+    const fn moves_top(self) -> bool {
+        matches!(self, Self::North | Self::NorthEast | Self::NorthWest)
+    }
+
+    const fn moves_bottom(self) -> bool {
+        matches!(self, Self::South | Self::SouthEast | Self::SouthWest)
+    }
+
+    const fn cursor_name(self) -> &'static str {
+        match self {
+            Self::North => "n-resize",
+            Self::NorthEast => "ne-resize",
+            Self::East => "e-resize",
+            Self::SouthEast => "se-resize",
+            Self::South => "s-resize",
+            Self::SouthWest => "sw-resize",
+            Self::West => "w-resize",
+            Self::NorthWest => "nw-resize",
+        }
+    }
+}
+
 #[derive(Clone)]
 struct OverlayState {
     x: Rc<Cell<f64>>,
@@ -169,6 +467,9 @@ struct OverlayState {
     drag_start_y: Rc<Cell<f64>>,
     dragging_chathead: Rc<Cell<bool>>,
     panel_open: Rc<Cell<bool>>,
+    panel_keyboard_captured: Rc<Cell<bool>>,
+    panel_size: Rc<Cell<PanelSize>>,
+    panel_rect_override: Rc<Cell<Option<PanelRect>>>,
     voice_state: Rc<Cell<VoiceState>>,
     voice_changed_at: Rc<Cell<Instant>>,
     shortcut_status: Rc<RefCell<ShortcutStatus>>,
@@ -184,6 +485,9 @@ impl OverlayState {
             drag_start_y: Rc::new(Cell::new(100.0)),
             dragging_chathead: Rc::new(Cell::new(false)),
             panel_open: Rc::new(Cell::new(false)),
+            panel_keyboard_captured: Rc::new(Cell::new(false)),
+            panel_size: Rc::new(Cell::new(current_panel_size())),
+            panel_rect_override: Rc::new(Cell::new(None)),
             voice_state: Rc::new(Cell::new(VoiceState::Idle)),
             voice_changed_at: Rc::new(Cell::new(Instant::now())),
             shortcut_status: Rc::new(RefCell::new(ShortcutStatus::Registering)),
@@ -195,17 +499,25 @@ impl OverlayState {
 #[derive(Clone)]
 struct PanelWidgets {
     container: gtk::Box,
-    status: gtk::Label,
+    header: gtk::Box,
     message: gtk::Label,
     chat_status: gtk::Label,
     transcript: gtk::Box,
     transcript_scroll: gtk::ScrolledWindow,
+    failure_row: gtk::Box,
+    link_confirmation: gtk::Box,
+    link_destination: gtk::Label,
+    link_cancel: gtk::Button,
+    link_open: gtk::Button,
+    composer_row: gtk::Box,
+    composer_scroll: gtk::ScrolledWindow,
     composer: gtk::TextView,
     composer_placeholder: gtk::Label,
     send: gtk::Button,
     retry: gtk::Button,
     failure: gtk::Label,
     info: gtk::Label,
+    open_settings: gtk::Button,
 }
 
 #[derive(Clone)]
@@ -216,10 +528,52 @@ struct PanelRuntime {
     chat_state: Rc<Cell<ExperimentalChatState>>,
     chat_message: Rc<RefCell<Option<String>>>,
     failure: Rc<RefCell<Option<String>>>,
+    rendered_messages: Rc<RefCell<Vec<RenderedMessage>>>,
+    stream_render_source: Rc<RefCell<Option<glib::SourceId>>>,
+    highlight_worker: HighlightWorker,
+    pending_link: Rc<RefCell<Option<String>>>,
+    voice: VoiceService,
+    pending_voice: Rc<RefCell<PendingVoice>>,
+    output: super::Output,
 }
 
 #[derive(Clone)]
-struct PositionRuntime {
+struct RenderedMessage {
+    id: String,
+    rendered_text: String,
+    rendered_state: MessageState,
+    revision: u64,
+    row: gtk::Box,
+    label: Option<gtk::Label>,
+    document: Option<AssistantDocument>,
+}
+
+#[derive(Default)]
+struct PendingVoice {
+    utterance_id: Option<u64>,
+}
+
+impl PendingVoice {
+    fn arm(&mut self, utterance_id: u64) {
+        self.utterance_id = Some(utterance_id);
+    }
+
+    fn cancel(&mut self) -> bool {
+        self.utterance_id.take().is_some()
+    }
+
+    fn consume(&mut self, utterance_id: u64) -> bool {
+        if self.utterance_id == Some(utterance_id) {
+            self.utterance_id = None;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+#[derive(Clone)]
+struct OverlayRuntime {
     window: gtk::ApplicationWindow,
     canvas: gtk::Fixed,
     chathead: gtk::DrawingArea,
@@ -231,6 +585,9 @@ pub(crate) fn start_native_overlay(
     app: &gtk::Application,
     codex: CodexAppServer,
     chat: ExperimentalChatSnapshot,
+    voice: VoiceService,
+    output: super::Output,
+    shortcut_status_sender: mpsc::Sender<ShortcutStatusUpdate>,
 ) -> Result<(), &'static str> {
     if let Some(existing) = app
         .windows()
@@ -279,6 +636,7 @@ pub(crate) fn start_native_overlay(
         .tooltip_text("ChatHead AI")
         .css_classes(["chathead"])
         .build();
+    chathead.set_cursor_from_name(Some("pointer"));
     let state_for_draw = state.clone();
     chathead.set_draw_func(move |_, context, width, height| {
         draw_companion_orb(
@@ -291,7 +649,7 @@ pub(crate) fn start_native_overlay(
         );
     });
 
-    let panel_widgets = build_panel();
+    let panel_widgets = build_panel(&output);
     let panel_runtime = PanelRuntime {
         widgets: panel_widgets.clone(),
         conversation: Rc::new(RefCell::new(Conversation::default())),
@@ -299,17 +657,31 @@ pub(crate) fn start_native_overlay(
         chat_state: Rc::new(Cell::new(chat.state)),
         chat_message: Rc::new(RefCell::new(chat.message)),
         failure: Rc::new(RefCell::new(None)),
+        rendered_messages: Rc::new(RefCell::new(Vec::new())),
+        stream_render_source: Rc::new(RefCell::new(None)),
+        highlight_worker: HighlightWorker::start(),
+        pending_link: Rc::new(RefCell::new(None)),
+        voice: voice.clone(),
+        pending_voice: Rc::new(RefCell::new(PendingVoice::default())),
+        output: output.clone(),
     };
+    apply_panel_metrics(&panel_runtime, current_panel_zoom());
+    apply_panel_dimensions(&panel_runtime, current_panel_size());
     wire_chat_controls(&panel_runtime);
+    attach_panel_zoom_controllers(&panel_runtime);
     render_chat(&panel_runtime);
-    PANEL_RUNTIME.with(|stored| stored.replace(Some(panel_runtime)));
+    PANEL_RUNTIME.with(|stored| stored.replace(Some(panel_runtime.clone())));
+    start_highlight_result_pump();
     let panel = panel_widgets.container.clone();
     panel.set_visible(false);
     canvas.put(&panel, 0.0, 0.0);
     canvas.put(&chathead, state.x.get(), state.y.get());
     window.set_child(Some(&canvas));
 
+    attach_hover_cursor(&canvas, &state);
     attach_drag_controller(&window, &canvas, &chathead, &panel, &state);
+    attach_focus_dismiss_controller(&window, &canvas, &state);
+    attach_panel_resize_controller(&window, &canvas, &panel_runtime, &state);
     attach_local_key_controller(&panel, event_sender.clone());
 
     let window_for_realize = window.clone();
@@ -320,8 +692,8 @@ pub(crate) fn start_native_overlay(
 
     window.present();
 
-    POSITION_RUNTIME.with(|stored| {
-        stored.replace(Some(PositionRuntime {
+    OVERLAY_RUNTIME.with(|stored| {
+        stored.replace(Some(OverlayRuntime {
             window: window.clone(),
             canvas: canvas.clone(),
             chathead: chathead.clone(),
@@ -335,27 +707,38 @@ pub(crate) fn start_native_overlay(
     let chathead_for_idle = chathead.clone();
     let panel_for_idle = panel.clone();
     let state_for_idle = state.clone();
+    let panel_runtime_for_idle = panel_runtime.clone();
     glib::idle_add_local_once(move || {
-        apply_preferred_position(
-            &PositionRuntime {
-                window: window_for_idle,
-                canvas: canvas_for_idle,
-                chathead: chathead_for_idle,
-                panel: panel_for_idle,
-                state: state_for_idle,
-            },
-            OverlayPosition::current(),
+        clamp_position(&canvas_for_idle, &state_for_idle);
+        let requested = state_for_idle.panel_size.get();
+        let effective = effective_panel_size(
+            requested,
+            canvas_for_idle.allocated_width(),
+            canvas_for_idle.allocated_height(),
         );
+        if effective != requested {
+            state_for_idle.panel_size.set(effective);
+            store_panel_size(effective);
+            apply_panel_dimensions(&panel_runtime_for_idle, effective);
+            emit_panel_size_changed(effective);
+        }
+        position_widgets(
+            &canvas_for_idle,
+            &chathead_for_idle,
+            &panel_for_idle,
+            &state_for_idle,
+        );
+        apply_idle_input_region(&window_for_idle, &state_for_idle);
     });
 
     attach_app_event_pump(
         event_receiver,
-        &chathead,
-        &panel_widgets.status,
         &panel_widgets.message,
         &state,
+        shortcut_status_sender,
     );
     start_shortcut_service(event_sender);
+    handle_voice_event(app, &VoiceEvent::Snapshot(voice.snapshot()));
     Ok(())
 }
 
@@ -366,7 +749,7 @@ pub(crate) fn stop_native_overlay(app: &gtk::Application) {
             let _ = runtime.codex.send(CodexCommand::NewChat);
         }
     });
-    POSITION_RUNTIME.with(|stored| {
+    OVERLAY_RUNTIME.with(|stored| {
         stored.take();
     });
     for window in app.windows() {
@@ -393,11 +776,12 @@ fn target_first_monitor(window: &gtk::ApplicationWindow) {
     window.set_default_size(geometry.width(), geometry.height());
 }
 
-fn build_panel() -> PanelWidgets {
+fn build_panel(output: &super::Output) -> PanelWidgets {
+    let panel_size = current_panel_size();
     let panel = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
-        .width_request(PANEL_WIDTH)
-        .height_request(PANEL_HEIGHT)
+        .width_request(i32::from(panel_size.width()))
+        .height_request(i32::from(panel_size.height()))
         .spacing(12)
         .css_classes(["chat-panel"])
         .build();
@@ -412,38 +796,44 @@ fn build_panel() -> PanelWidgets {
         .hexpand(true)
         .css_classes(["panel-title"])
         .build();
-    let experimental = gtk::Label::builder()
-        .label("Experimental")
-        .css_classes(["experimental-badge"])
-        .build();
     let chat_status = gtk::Label::builder()
-        .label("Checking…")
-        .css_classes(["status"])
+        .label("● Checking · ChatGPT")
+        .css_classes(["provider-status"])
         .build();
     let new_chat = gtk::Button::builder()
-        .label("New Chat")
+        .label("＋")
+        .tooltip_text("New chat")
         .css_classes(["new-chat"])
         .build();
     header.append(&title);
-    header.append(&experimental);
     header.append(&chat_status);
     header.append(&new_chat);
 
-    let status = gtk::Label::builder()
-        .label("Voice shortcut…")
-        .xalign(0.0)
-        .css_classes(["voice-status"])
-        .build();
-
     let message = gtk::Label::builder()
         .label(format!(
-            "Voice toggle is registering through the XDG portal. Preferred shortcut: {VOICE_TOGGLE_LABEL}."
+            "Voice shortcut is registering through the XDG portal. Preferred shortcut: {VOICE_TOGGLE_LABEL}."
         ))
         .wrap(true)
         .xalign(0.0)
         .yalign(0.0)
         .css_classes(["voice-message"])
         .build();
+    let open_settings = gtk::Button::builder()
+        .label("Open Settings")
+        .halign(gtk::Align::Start)
+        .visible(false)
+        .build();
+    let output_for_settings = output.clone();
+    open_settings.connect_clicked(move |_| {
+        super::write_message(
+            &output_for_settings,
+            &IpcEvent {
+                protocol_version: PROTOCOL_VERSION,
+                event: "openSettings",
+                payload: serde_json::json!({ "section": "localVoice" }),
+            },
+        );
+    });
 
     let transcript = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -459,9 +849,11 @@ fn build_panel() -> PanelWidgets {
     transcript_scroll.set_child(Some(&transcript));
 
     let info = gtk::Label::builder()
-        .label("Experimental chat uses your authenticated ChatGPT subscription through Codex.")
+        .label("Start a conversation with ChatHead.")
         .wrap(true)
-        .xalign(0.0)
+        .xalign(0.5)
+        .vexpand(true)
+        .valign(gtk::Align::Center)
         .css_classes(["chat-info"])
         .build();
 
@@ -479,20 +871,49 @@ fn build_panel() -> PanelWidgets {
     failure_row.append(&failure);
     failure_row.append(&retry);
 
+    let link_confirmation = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(8)
+        .visible(false)
+        .css_classes(["link-confirmation"])
+        .build();
+    let link_destination = gtk::Label::builder()
+        .wrap(true)
+        .ellipsize(gtk::pango::EllipsizeMode::Middle)
+        .max_width_chars(48)
+        .xalign(0.0)
+        .hexpand(true)
+        .selectable(true)
+        .css_classes(["link-destination"])
+        .build();
+    let link_cancel = gtk::Button::builder()
+        .label("Cancel")
+        .focusable(true)
+        .build();
+    let link_open = gtk::Button::builder()
+        .label("Open")
+        .focusable(true)
+        .css_classes(["suggested-action"])
+        .build();
+    link_confirmation.append(&link_destination);
+    link_confirmation.append(&link_cancel);
+    link_confirmation.append(&link_open);
+
     let composer_row = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(8)
+        .css_classes(["composer-bar"])
         .build();
     let composer = gtk::TextView::builder()
         .wrap_mode(gtk::WrapMode::WordChar)
         .accepts_tab(false)
         .hexpand(true)
-        .height_request(58)
+        .height_request(42)
         .css_classes(["prompt-input"])
         .build();
     let composer_scroll = gtk::ScrolledWindow::builder()
         .hexpand(true)
-        .height_request(64)
+        .height_request(46)
         .hscrollbar_policy(gtk::PolicyType::Never)
         .vscrollbar_policy(gtk::PolicyType::Automatic)
         .css_classes(["prompt-frame"])
@@ -502,8 +923,8 @@ fn build_panel() -> PanelWidgets {
         .label("Message ChatHead…")
         .halign(gtk::Align::Start)
         .valign(gtk::Align::Start)
-        .margin_start(9)
-        .margin_top(8)
+        .margin_start(8)
+        .margin_top(12)
         .css_classes(["prompt-placeholder"])
         .build();
     composer_placeholder.set_can_target(false);
@@ -512,25 +933,30 @@ fn build_panel() -> PanelWidgets {
     composer_overlay.set_child(Some(&composer_scroll));
     composer_overlay.add_overlay(&composer_placeholder);
     let send = gtk::Button::builder()
-        .label("Send")
-        .valign(gtk::Align::Fill)
+        .label("↑")
+        .tooltip_text("Send message")
+        .valign(gtk::Align::Center)
+        .sensitive(false)
         .css_classes(["send-button"])
         .build();
     composer_row.append(&composer_overlay);
     composer_row.append(&send);
 
     panel.append(&header);
-    panel.append(&status);
     panel.append(&message);
+    panel.append(&open_settings);
     panel.append(&info);
     panel.append(&transcript_scroll);
     panel.append(&failure_row);
+    panel.append(&link_confirmation);
     panel.append(&composer_row);
     new_chat.connect_clicked(|_| {
         PANEL_RUNTIME.with(|stored| {
             if let Some(runtime) = stored.borrow().as_ref() {
                 runtime.conversation.borrow_mut().new_chat();
                 runtime.failure.replace(None);
+                runtime.pending_link.replace(None);
+                runtime.widgets.link_confirmation.set_visible(false);
                 let _ = runtime.codex.send(CodexCommand::NewChat);
                 render_chat(runtime);
             }
@@ -538,18 +964,201 @@ fn build_panel() -> PanelWidgets {
     });
     PanelWidgets {
         container: panel,
-        status,
+        header,
         message,
         chat_status,
         transcript,
         transcript_scroll,
+        failure_row,
+        link_confirmation,
+        link_destination,
+        link_cancel,
+        link_open,
+        composer_row,
+        composer_scroll,
         composer,
         composer_placeholder,
         send,
         retry,
         failure,
         info,
+        open_settings,
     }
+}
+
+#[derive(Clone, Copy)]
+enum TranscriptAnchor {
+    Bottom,
+    Normalized(f64),
+}
+
+impl TranscriptAnchor {
+    fn capture(scroll: &gtk::ScrolledWindow) -> Self {
+        let adjustment = scroll.vadjustment();
+        let range = (adjustment.upper() - adjustment.page_size()).max(0.0);
+        if range <= 0.0 || adjustment.value() >= range - 28.0 {
+            Self::Bottom
+        } else {
+            Self::Normalized((adjustment.value() / range).clamp(0.0, 1.0))
+        }
+    }
+
+    fn restore(self, adjustment: &gtk::Adjustment) {
+        let range = (adjustment.upper() - adjustment.page_size()).max(0.0);
+        adjustment.set_value(match self {
+            Self::Bottom => range,
+            Self::Normalized(position) => range * position,
+        });
+    }
+}
+
+fn apply_panel_metrics(runtime: &PanelRuntime, zoom: PanelZoom) {
+    let anchor = TranscriptAnchor::capture(&runtime.widgets.transcript_scroll);
+    let metrics = PanelMetrics::for_zoom(zoom);
+    runtime.widgets.container.set_spacing(metrics.panel_spacing);
+    runtime.widgets.header.set_spacing(metrics.row_spacing);
+    runtime.widgets.failure_row.set_spacing(metrics.row_spacing);
+    runtime
+        .widgets
+        .composer_row
+        .set_spacing(metrics.row_spacing);
+    runtime
+        .widgets
+        .transcript
+        .set_spacing(metrics.transcript_spacing);
+    runtime
+        .widgets
+        .composer_scroll
+        .set_height_request(metrics.composer_height);
+    runtime
+        .widgets
+        .composer
+        .set_height_request(metrics.composer_view_height);
+    runtime.widgets.container.set_size_request(
+        i32::from(current_panel_size().width()),
+        i32::from(current_panel_size().height()),
+    );
+
+    let max_width_chars = panel_bubble_width_chars(current_panel_size(), zoom);
+    for rendered in runtime.rendered_messages.borrow().iter() {
+        if let Some(label) = &rendered.label {
+            label.set_max_width_chars(max_width_chars);
+        }
+    }
+
+    runtime.widgets.container.queue_resize();
+    let adjustment = runtime.widgets.transcript_scroll.vadjustment();
+    glib::idle_add_local_once(move || anchor.restore(&adjustment));
+}
+
+fn apply_panel_dimensions(runtime: &PanelRuntime, size: PanelSize) {
+    runtime
+        .widgets
+        .container
+        .set_size_request(i32::from(size.width()), i32::from(size.height()));
+    for class in ["panel-compact", "panel-standard", "panel-expanded"] {
+        runtime.widgets.container.remove_css_class(class);
+    }
+    let compact = size.width() < 560;
+    runtime.widgets.container.add_css_class(if compact {
+        "panel-compact"
+    } else if size.width() < 720 {
+        "panel-standard"
+    } else {
+        "panel-expanded"
+    });
+    runtime.widgets.chat_status.set_ellipsize(if compact {
+        gtk::pango::EllipsizeMode::End
+    } else {
+        gtk::pango::EllipsizeMode::None
+    });
+    runtime
+        .widgets
+        .chat_status
+        .set_max_width_chars(if compact { 18 } else { 30 });
+    let max_width_chars = panel_bubble_width_chars(size, current_panel_zoom());
+    for rendered in runtime.rendered_messages.borrow().iter() {
+        if let Some(label) = &rendered.label {
+            label.set_max_width_chars(max_width_chars);
+        }
+    }
+    runtime.widgets.container.queue_resize();
+}
+
+fn panel_bubble_width_chars(size: PanelSize, zoom: PanelZoom) -> i32 {
+    let base = if size.width() < 560 {
+        32_u16
+    } else if size.width() < 720 {
+        44
+    } else {
+        72
+    };
+    i32::from(base.saturating_mul(100) / zoom.value()).max(22)
+}
+
+fn change_panel_zoom(runtime: &PanelRuntime, zoom: PanelZoom) {
+    if zoom == current_panel_zoom() {
+        return;
+    }
+    set_native_panel_zoom(zoom);
+    super::write_message(
+        &runtime.output,
+        &IpcEvent {
+            protocol_version: PROTOCOL_VERSION,
+            event: "panelZoomChanged",
+            payload: zoom,
+        },
+    );
+}
+
+fn attach_panel_zoom_controllers(runtime: &PanelRuntime) {
+    let scroll = gtk::EventControllerScroll::new(
+        gtk::EventControllerScrollFlags::VERTICAL | gtk::EventControllerScrollFlags::DISCRETE,
+    );
+    scroll.set_propagation_phase(gtk::PropagationPhase::Capture);
+    let runtime_for_scroll = runtime.clone();
+    scroll.connect_scroll(move |controller, _, dy| {
+        if !controller
+            .current_event_state()
+            .contains(gdk::ModifierType::CONTROL_MASK)
+        {
+            return glib::Propagation::Proceed;
+        }
+        let current = current_panel_zoom();
+        if dy < 0.0 {
+            change_panel_zoom(&runtime_for_scroll, current.next());
+        } else if dy > 0.0 {
+            change_panel_zoom(&runtime_for_scroll, current.previous());
+        }
+        glib::Propagation::Stop
+    });
+    runtime.widgets.container.add_controller(scroll);
+
+    let key = gtk::EventControllerKey::new();
+    key.set_propagation_phase(gtk::PropagationPhase::Capture);
+    let runtime_for_key = runtime.clone();
+    key.connect_key_pressed(move |_, key, _, modifiers| {
+        if !modifiers.contains(gdk::ModifierType::CONTROL_MASK) {
+            return glib::Propagation::Proceed;
+        }
+        let current = current_panel_zoom();
+        let next = if matches!(key, gdk::Key::plus | gdk::Key::equal | gdk::Key::KP_Add) {
+            Some(current.next())
+        } else if matches!(key, gdk::Key::minus | gdk::Key::KP_Subtract) {
+            Some(current.previous())
+        } else if matches!(key, gdk::Key::_0 | gdk::Key::KP_0) {
+            Some(PanelZoom::reset())
+        } else {
+            None
+        };
+        if let Some(next) = next {
+            change_panel_zoom(&runtime_for_key, next);
+            glib::Propagation::Stop
+        } else {
+            glib::Propagation::Proceed
+        }
+    });
+    runtime.widgets.container.add_controller(key);
 }
 
 fn wire_chat_controls(runtime: &PanelRuntime) {
@@ -574,9 +1183,45 @@ fn wire_chat_controls(runtime: &PanelRuntime) {
         }
     });
 
+    let runtime_for_link_cancel = runtime.clone();
+    runtime.widgets.link_cancel.connect_clicked(move |_| {
+        runtime_for_link_cancel.pending_link.replace(None);
+        runtime_for_link_cancel
+            .widgets
+            .link_confirmation
+            .set_visible(false);
+        runtime_for_link_cancel.widgets.composer.grab_focus();
+    });
+
+    let runtime_for_link_open = runtime.clone();
+    runtime.widgets.link_open.connect_clicked(move |_| {
+        let destination = runtime_for_link_open.pending_link.borrow().clone();
+        let Some(destination) = destination else {
+            return;
+        };
+        match open_confirmed_uri(&destination) {
+            Ok(()) => {
+                runtime_for_link_open.pending_link.replace(None);
+                runtime_for_link_open
+                    .widgets
+                    .link_confirmation
+                    .set_visible(false);
+            }
+            Err(error) => {
+                runtime_for_link_open
+                    .widgets
+                    .link_destination
+                    .set_label(&format!("Could not open {destination}: {error}"));
+            }
+        }
+    });
+
     let key = gtk::EventControllerKey::new();
     let runtime_for_key = runtime.clone();
     key.connect_key_pressed(move |_, key, _, modifiers| {
+        if key == gdk::Key::Return && runtime_for_key.conversation.borrow().is_busy() {
+            return glib::Propagation::Stop;
+        }
         if key == gdk::Key::Return && !modifiers.contains(gdk::ModifierType::SHIFT_MASK) {
             submit_composer(&runtime_for_key);
             glib::Propagation::Stop
@@ -587,6 +1232,9 @@ fn wire_chat_controls(runtime: &PanelRuntime) {
     runtime.widgets.composer.add_controller(key);
 
     let placeholder = runtime.widgets.composer_placeholder.clone();
+    let send = runtime.widgets.send.clone();
+    let chat_state = runtime.chat_state.clone();
+    let conversation = runtime.conversation.clone();
     runtime
         .widgets
         .composer
@@ -594,6 +1242,8 @@ fn wire_chat_controls(runtime: &PanelRuntime) {
         .connect_changed(move |buffer| {
             let text = buffer.text(&buffer.start_iter(), &buffer.end_iter(), true);
             placeholder.set_visible(text.is_empty());
+            let ready = chat_state.get() == ExperimentalChatState::Ready;
+            send.set_sensitive(ready && (conversation.borrow().is_busy() || !text.is_empty()));
         });
 }
 
@@ -673,8 +1323,7 @@ pub(crate) fn handle_codex_event(_app: &gtk::Application, event: &CodexEvent) {
                 } else {
                     runtime.chat_state.set(ExperimentalChatState::Unavailable);
                     runtime.chat_message.replace(Some(
-                        "Connect a ChatGPT subscription in Settings to use Experimental chat."
-                            .to_owned(),
+                        "Connect a ChatGPT subscription in Settings to use ChatHead.".to_owned(),
                     ));
                 }
             }
@@ -684,7 +1333,73 @@ pub(crate) fn handle_codex_event(_app: &gtk::Application, event: &CodexEvent) {
             }
             _ => runtime.conversation.borrow_mut().apply(event),
         }
-        render_chat(runtime);
+        if matches!(event, CodexEvent::AssistantTextDelta { .. }) {
+            schedule_stream_render(runtime);
+        } else {
+            cancel_stream_render(runtime);
+            render_chat(runtime);
+        }
+    });
+}
+
+fn schedule_stream_render(runtime: &PanelRuntime) {
+    if runtime.stream_render_source.borrow().is_some() {
+        return;
+    }
+
+    let runtime_for_render = runtime.clone();
+    let source = glib::timeout_add_local_once(
+        Duration::from_millis(STREAM_RENDER_INTERVAL_MS),
+        move || {
+            runtime_for_render.stream_render_source.replace(None);
+            render_chat(&runtime_for_render);
+        },
+    );
+    runtime.stream_render_source.replace(Some(source));
+}
+
+fn cancel_stream_render(runtime: &PanelRuntime) {
+    if let Some(source) = runtime.stream_render_source.take() {
+        source.remove();
+    }
+}
+
+fn start_highlight_result_pump() {
+    glib::timeout_add_local(Duration::from_millis(ACTION_POLL_MS), move || {
+        let mut keep_running = false;
+        PANEL_RUNTIME.with(|stored| {
+            let runtime_ref = stored.borrow();
+            let Some(runtime) = runtime_ref.as_ref() else {
+                return;
+            };
+            keep_running = true;
+            let results = runtime.highlight_worker.drain();
+            if results.is_empty() {
+                return;
+            }
+            let anchor = TranscriptAnchor::capture(&runtime.widgets.transcript_scroll);
+            let rendered = runtime.rendered_messages.borrow();
+            let mut applied = false;
+            for result in &results {
+                if let Some(message) = rendered
+                    .iter()
+                    .find(|message| message.id == result.message_id)
+                    && let Some(document) = &message.document
+                {
+                    applied |= document.apply_highlight(result);
+                }
+            }
+            if applied {
+                runtime.widgets.transcript.queue_resize();
+                let adjustment = runtime.widgets.transcript_scroll.vadjustment();
+                glib::idle_add_local_once(move || anchor.restore(&adjustment));
+            }
+        });
+        if keep_running {
+            glib::ControlFlow::Continue
+        } else {
+            glib::ControlFlow::Break
+        }
     });
 }
 
@@ -692,33 +1407,33 @@ fn render_chat(runtime: &PanelRuntime) {
     let adjustment = runtime.widgets.transcript_scroll.vadjustment();
     let near_bottom = adjustment.value() + adjustment.page_size() >= adjustment.upper() - 28.0;
 
-    while let Some(child) = runtime.widgets.transcript.first_child() {
-        runtime.widgets.transcript.remove(&child);
-    }
     let conversation = runtime.conversation.borrow();
-    for message in conversation.messages() {
-        runtime.widgets.transcript.append(&message_bubble(message));
-    }
+    sync_transcript(runtime, conversation.messages());
 
     let busy = conversation.is_busy();
     let ready = runtime.chat_state.get() == ExperimentalChatState::Ready;
     runtime.widgets.chat_status.set_label(if busy {
-        "Thinking"
+        "● Thinking · ChatGPT"
     } else if ready {
-        "Ready"
+        "● Ready · ChatGPT"
     } else {
-        "Unavailable"
+        "● Unavailable · ChatGPT"
     });
-    runtime.widgets.chat_status.set_css_classes(if ready {
-        &["status"]
+    runtime.widgets.chat_status.set_css_classes(if busy {
+        &["provider-status", "provider-status-busy"]
+    } else if ready {
+        &["provider-status"]
     } else {
-        &["status", "status-error"]
+        &["provider-status", "provider-status-error"]
     });
-    runtime
-        .widgets
-        .send
-        .set_label(if busy { "Stop" } else { "Send" });
-    runtime.widgets.composer.set_sensitive(ready && !busy);
+    runtime.widgets.send.set_label(if busy { "■" } else { "↑" });
+    runtime.widgets.send.set_tooltip_text(Some(if busy {
+        "Stop response"
+    } else {
+        "Send message"
+    }));
+    runtime.widgets.composer.set_sensitive(ready);
+    runtime.widgets.composer.set_editable(ready && !busy);
     let composer_buffer = runtime.widgets.composer.buffer();
     let composer_text = composer_buffer.text(
         &composer_buffer.start_iter(),
@@ -729,16 +1444,25 @@ fn render_chat(runtime: &PanelRuntime) {
         .widgets
         .composer_placeholder
         .set_visible(ready && !busy && composer_text.is_empty());
-    runtime.widgets.send.set_sensitive(ready);
+    runtime
+        .widgets
+        .send
+        .set_sensitive(ready && (busy || !composer_text.is_empty()));
 
-    let info = runtime.chat_message.borrow().clone().unwrap_or_else(|| {
-        "Experimental chat uses your authenticated ChatGPT subscription through Codex.".to_owned()
-    });
+    let info = runtime
+        .chat_message
+        .borrow()
+        .clone()
+        .unwrap_or_else(|| "Start a conversation with ChatHead.".to_owned());
     runtime.widgets.info.set_label(&info);
     runtime
         .widgets
         .info
         .set_visible(conversation.messages().is_empty() || !ready);
+    runtime
+        .widgets
+        .transcript_scroll
+        .set_visible(!conversation.messages().is_empty());
 
     let failure = runtime.failure.borrow().clone();
     runtime
@@ -759,48 +1483,263 @@ fn render_chat(runtime: &PanelRuntime) {
     }
 }
 
-fn message_bubble(message: &ChatMessage) -> gtk::Box {
+fn sync_transcript(runtime: &PanelRuntime, messages: &[ChatMessage]) {
+    let mut rendered = runtime.rendered_messages.borrow_mut();
+    let needs_reset = rendered.len() > messages.len()
+        || rendered
+            .iter()
+            .zip(messages)
+            .any(|(widget, message)| widget.id != message.id);
+
+    if needs_reset {
+        while let Some(child) = runtime.widgets.transcript.first_child() {
+            runtime.widgets.transcript.remove(&child);
+        }
+        rendered.clear();
+    }
+
+    for message in messages.iter().skip(rendered.len()) {
+        let widget = message_widget(message, &runtime.highlight_worker);
+        runtime.widgets.transcript.append(&widget.row);
+        rendered.push(widget);
+    }
+
+    for (widget, message) in rendered.iter_mut().zip(messages) {
+        if widget.rendered_text == message.text && widget.rendered_state == message.state {
+            continue;
+        }
+
+        match message.role {
+            MessageRole::User => {
+                if let Some(label) = &widget.label {
+                    label.set_label(&message.text);
+                }
+            }
+            MessageRole::Assistant if message.text.is_empty() => {}
+            MessageRole::Assistant => {
+                if let Some(document) = &widget.document {
+                    document.update(&message.text, message.state, OrbTheme::current().into());
+                } else {
+                    while let Some(child) = widget.row.first_child() {
+                        widget.row.remove(&child);
+                    }
+                    let document = assistant_document(message, &runtime.highlight_worker);
+                    widget.row.append(&document.widget());
+                    widget.document = Some(document);
+                }
+            }
+        }
+        widget.rendered_text.clone_from(&message.text);
+        widget.rendered_state = message.state;
+        widget.revision = widget.revision.saturating_add(1);
+    }
+}
+
+fn message_widget(message: &ChatMessage, worker: &HighlightWorker) -> RenderedMessage {
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    row.set_hexpand(message.role == MessageRole::Assistant);
     row.set_halign(match message.role {
         MessageRole::User => gtk::Align::End,
-        MessageRole::Assistant => gtk::Align::Start,
+        MessageRole::Assistant => gtk::Align::Fill,
     });
-    let text = if message.text.is_empty() && message.state == MessageState::Streaming {
-        "…"
-    } else {
-        &message.text
-    };
-    let label = gtk::Label::builder()
-        .label(text)
+
+    if message.text.is_empty() && message.state == MessageState::Streaming {
+        row.append(&thinking_bubble());
+        return RenderedMessage {
+            id: message.id.clone(),
+            rendered_text: String::new(),
+            rendered_state: message.state,
+            revision: 0,
+            row,
+            label: None,
+            document: None,
+        };
+    }
+
+    match message.role {
+        MessageRole::User => {
+            let label = user_message_label(message);
+            row.append(&user_message_widget(message, &label));
+            RenderedMessage {
+                id: message.id.clone(),
+                rendered_text: message.text.clone(),
+                rendered_state: message.state,
+                revision: 1,
+                row,
+                label: Some(label),
+                document: None,
+            }
+        }
+        MessageRole::Assistant => {
+            let document = assistant_document(message, worker);
+            row.append(&document.widget());
+            RenderedMessage {
+                id: message.id.clone(),
+                rendered_text: message.text.clone(),
+                rendered_state: message.state,
+                revision: 1,
+                row,
+                label: None,
+                document: Some(document),
+            }
+        }
+    }
+}
+
+fn user_message_label(message: &ChatMessage) -> gtk::Label {
+    let max_width_chars = panel_bubble_width_chars(current_panel_size(), current_panel_zoom());
+    gtk::Label::builder()
+        .label(&message.text)
         .wrap(true)
         .wrap_mode(gtk::pango::WrapMode::WordChar)
         .selectable(true)
         .xalign(0.0)
-        .max_width_chars(38)
-        .css_classes(match message.role {
-            MessageRole::User => ["chat-bubble", "user-bubble"],
-            MessageRole::Assistant => ["chat-bubble", "assistant-bubble"],
-        })
+        .max_width_chars(max_width_chars)
+        .css_classes(["chat-bubble", "user-bubble"])
+        .build()
+}
+
+fn user_message_widget(message: &ChatMessage, label: &gtk::Label) -> gtk::Box {
+    let container = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(2)
+        .halign(gtk::Align::End)
+        .css_classes(["user-message"])
         .build();
-    row.append(&label);
-    row
+    let actions = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .halign(gtk::Align::End)
+        .css_classes(["user-message-actions"])
+        .build();
+    let copy = gtk::Button::builder()
+        .icon_name("edit-copy-symbolic")
+        .tooltip_text("Copy prompt")
+        .focusable(true)
+        .css_classes(["response-action", "user-copy-action"])
+        .build();
+    let prompt = message.text.clone();
+    copy.connect_clicked(move |button| copy_text_to_clipboard(button, &prompt));
+    actions.append(&copy);
+    container.append(label);
+    container.append(&actions);
+    container
+}
+
+fn assistant_document(message: &ChatMessage, worker: &HighlightWorker) -> AssistantDocument {
+    let link_handler: LinkHandler = Rc::new(request_link_confirmation);
+    let assistant_message_id = message.id.clone();
+    let retry_handler: RetryHandler = Rc::new(move || {
+        retry_assistant_response(&assistant_message_id);
+    });
+    AssistantDocument::new(
+        &message.id,
+        &message.text,
+        message.state,
+        OrbTheme::current().into(),
+        worker,
+        link_handler,
+        retry_handler,
+    )
+}
+
+fn retry_assistant_response(assistant_message_id: &str) {
+    PANEL_RUNTIME.with(|stored| {
+        let runtime_ref = stored.borrow();
+        let Some(runtime) = runtime_ref.as_ref() else {
+            return;
+        };
+        let prompt = runtime
+            .conversation
+            .borrow()
+            .prompt_for_assistant(assistant_message_id)
+            .map(str::to_owned);
+        if let Some(prompt) = prompt {
+            submit_text(runtime, &prompt);
+        }
+    });
+}
+
+fn request_link_confirmation(destination: String) {
+    PANEL_RUNTIME.with(|stored| {
+        let runtime_ref = stored.borrow();
+        let Some(runtime) = runtime_ref.as_ref() else {
+            return;
+        };
+        runtime.pending_link.replace(Some(destination.clone()));
+        runtime
+            .widgets
+            .link_destination
+            .set_label(&format!("Open this link? {destination}"));
+        runtime.widgets.link_confirmation.set_visible(true);
+        runtime.widgets.link_cancel.grab_focus();
+    });
+}
+
+fn thinking_bubble() -> gtk::Box {
+    let bubble = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(8)
+        .css_classes(["chat-bubble", "assistant-bubble", "thinking-bubble"])
+        .build();
+    let dots = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(3)
+        .build();
+    let dot_labels = (0..3)
+        .map(|index| {
+            let dot = gtk::Label::builder()
+                .label("●")
+                .css_classes(["thinking-dot"])
+                .build();
+            dot.set_opacity(if index == 0 { 1.0 } else { 0.32 });
+            dots.append(&dot);
+            dot
+        })
+        .collect::<Vec<_>>();
+    let label = gtk::Label::builder()
+        .label("Thinking")
+        .css_classes(["thinking-label"])
+        .build();
+    bubble.append(&dots);
+    bubble.append(&label);
+
+    let weak_dots = dot_labels
+        .iter()
+        .map(glib::object::ObjectExt::downgrade)
+        .collect::<Vec<_>>();
+    let phase = Rc::new(Cell::new(0_usize));
+    glib::timeout_add_local(Duration::from_millis(240), move || {
+        let next_phase = (phase.get() + 1) % weak_dots.len();
+        phase.set(next_phase);
+        let mut is_visible = false;
+        for (index, weak_dot) in weak_dots.iter().enumerate() {
+            if let Some(dot) = weak_dot.upgrade() {
+                dot.set_opacity(if index == next_phase { 1.0 } else { 0.32 });
+                is_visible = true;
+            }
+        }
+        if is_visible {
+            glib::ControlFlow::Continue
+        } else {
+            glib::ControlFlow::Break
+        }
+    });
+
+    bubble
 }
 
 fn attach_app_event_pump(
     receiver: mpsc::Receiver<AppEvent>,
-    chathead: &gtk::DrawingArea,
-    status: &gtk::Label,
     message: &gtk::Label,
     state: &OverlayState,
+    shortcut_status_sender: mpsc::Sender<ShortcutStatusUpdate>,
 ) {
-    let chathead = chathead.clone();
-    let status = status.clone();
     let message = message.clone();
     let state = state.clone();
 
     glib::timeout_add_local(Duration::from_millis(ACTION_POLL_MS), move || {
         while let Ok(event) = receiver.try_recv() {
-            handle_app_event(event, &chathead, &status, &message, &state);
+            handle_app_event(event, &message, &state, &shortcut_status_sender);
         }
 
         glib::ControlFlow::Continue
@@ -809,87 +1748,258 @@ fn attach_app_event_pump(
 
 fn handle_app_event(
     event: AppEvent,
-    chathead: &gtk::DrawingArea,
-    status: &gtk::Label,
     message: &gtk::Label,
     state: &OverlayState,
+    shortcut_status_sender: &mpsc::Sender<ShortcutStatusUpdate>,
 ) {
     match event {
-        AppEvent::StopVoice => stop_voice_state(chathead, status, message, state),
-        AppEvent::ToggleVoice => toggle_voice_state(chathead, status, message, state),
-        AppEvent::ShortcutStatus(shortcut_status) => {
+        AppEvent::CancelVoice => cancel_voice(),
+        AppEvent::VoiceShortcutActivated => {
+            reveal_panel();
+            PANEL_RUNTIME.with(|stored| {
+                if let Some(runtime) = stored.borrow().as_ref() {
+                    let busy = runtime.conversation.borrow().is_busy();
+                    let ready = runtime.chat_state.get() == ExperimentalChatState::Ready;
+                    let _ = runtime.voice.shortcut_activated(busy, ready);
+                }
+            });
+        }
+        AppEvent::VoiceShortcutDeactivated => {
+            PANEL_RUNTIME.with(|stored| {
+                if let Some(runtime) = stored.borrow().as_ref() {
+                    let _ = runtime.voice.shortcut_deactivated();
+                }
+            });
+        }
+        AppEvent::TogglePanel => toggle_panel(),
+        AppEvent::ShortcutStatus(action, shortcut_status) => {
+            let protocol_status = match &shortcut_status {
+                ShortcutStatus::Registering => ProtocolShortcutStatus::Registering,
+                ShortcutStatus::Ready(trigger) => ProtocolShortcutStatus::Ready {
+                    trigger: trigger.clone(),
+                },
+                ShortcutStatus::ConflictPossible(details) => {
+                    ProtocolShortcutStatus::ConflictPossible {
+                        details: details.clone(),
+                    }
+                }
+                ShortcutStatus::Unavailable(details) => ProtocolShortcutStatus::Unavailable {
+                    details: details.clone(),
+                },
+            };
+            let _ = shortcut_status_sender.send(ShortcutStatusUpdate {
+                action,
+                status: protocol_status,
+            });
+            if action == ShortcutAction::Panel {
+                return;
+            }
             state.shortcut_status.replace(shortcut_status);
-            update_status_widgets(status, message, state);
+            let voice_snapshot = PANEL_RUNTIME.with(|stored| {
+                stored
+                    .borrow()
+                    .as_ref()
+                    .map(|runtime| runtime.voice.snapshot())
+            });
+            if let Some(snapshot) =
+                voice_snapshot.filter(|snapshot| snapshot.phase != VoicePhase::Ready)
+            {
+                render_voice_snapshot(&snapshot);
+            } else {
+                update_shortcut_message(message, state);
+            }
         }
     }
 }
 
-fn toggle_voice_state(
-    chathead: &gtk::DrawingArea,
-    status: &gtk::Label,
-    message: &gtk::Label,
-    state: &OverlayState,
-) {
-    let next = match state.voice_state.get() {
-        VoiceState::Idle => VoiceState::Listening,
-        VoiceState::Listening => VoiceState::Idle,
-    };
-
-    state.voice_state.set(next);
-    state.voice_changed_at.set(Instant::now());
-    update_status_widgets(status, message, state);
-    start_or_continue_animation(chathead, state);
+fn cancel_voice() {
+    PANEL_RUNTIME.with(|stored| {
+        if let Some(runtime) = stored.borrow().as_ref() {
+            if runtime.pending_voice.borrow_mut().cancel() {
+                runtime.widgets.composer.buffer().set_text("");
+            }
+            let _ = runtime.voice.cancel();
+            runtime.widgets.composer.grab_focus();
+        }
+    });
 }
 
-fn stop_voice_state(
-    chathead: &gtk::DrawingArea,
-    status: &gtk::Label,
-    message: &gtk::Label,
-    state: &OverlayState,
-) {
-    if state.voice_state.get() == VoiceState::Idle {
-        return;
+fn reveal_panel() {
+    set_panel_open(true);
+}
+
+fn toggle_panel() {
+    let open = OVERLAY_RUNTIME.with(|stored| {
+        let runtime_ref = stored.borrow();
+        let Some(runtime) = runtime_ref.as_ref() else {
+            return false;
+        };
+        !runtime.state.panel_open.get()
+    });
+    set_panel_open(open);
+}
+
+fn set_panel_open(open: bool) {
+    let changed = OVERLAY_RUNTIME.with(|stored| {
+        let runtime_ref = stored.borrow();
+        let Some(runtime) = runtime_ref.as_ref() else {
+            return false;
+        };
+        runtime.state.panel_open.set(open);
+        runtime.state.panel_keyboard_captured.set(open);
+        runtime.state.panel_rect_override.set(None);
+        runtime.panel.set_visible(open);
+        runtime.window.set_keyboard_mode(if open {
+            KeyboardMode::Exclusive
+        } else {
+            KeyboardMode::None
+        });
+        position_widgets(
+            &runtime.canvas,
+            &runtime.chathead,
+            &runtime.panel,
+            &runtime.state,
+        );
+        apply_idle_input_region(&runtime.window, &runtime.state);
+        if open {
+            runtime.window.present();
+        }
+        true
+    });
+    if changed && open {
+        PANEL_RUNTIME.with(|stored| {
+            if let Some(runtime) = stored.borrow().as_ref() {
+                runtime.widgets.composer.grab_focus();
+                focus_composer_when_mapped(&runtime.widgets.composer);
+            }
+        });
     }
-
-    state.voice_state.set(VoiceState::Idle);
-    state.voice_changed_at.set(Instant::now());
-    update_status_widgets(status, message, state);
-    start_or_continue_animation(chathead, state);
 }
 
-fn update_status_widgets(status: &gtk::Label, message: &gtk::Label, state: &OverlayState) {
+pub(crate) fn handle_voice_event(_app: &gtk::Application, event: &VoiceEvent) {
+    match event {
+        VoiceEvent::Snapshot(snapshot) => render_voice_snapshot(snapshot),
+        VoiceEvent::Transcript { utterance_id, text } => {
+            let utterance_id = *utterance_id;
+            PANEL_RUNTIME.with(|stored| {
+                let runtime_ref = stored.borrow();
+                let Some(runtime) = runtime_ref.as_ref() else {
+                    return;
+                };
+                runtime.widgets.composer.buffer().set_text(text);
+                runtime.widgets.composer.grab_focus();
+                if !should_auto_send_voice(runtime.voice.snapshot().submission_mode) {
+                    let _ = runtime.voice.complete_utterance(utterance_id);
+                    return;
+                }
+                runtime.pending_voice.borrow_mut().arm(utterance_id);
+                let runtime_for_send = runtime.clone();
+                glib::timeout_add_local_once(VOICE_SEND_DELAY, move || {
+                    if runtime_for_send.voice.snapshot().phase != VoicePhase::PendingSend
+                        || !runtime_for_send
+                            .pending_voice
+                            .borrow_mut()
+                            .consume(utterance_id)
+                    {
+                        return;
+                    }
+                    if runtime_for_send.conversation.borrow().is_busy() {
+                        runtime_for_send.failure.replace(Some(
+                            "Voice message was not sent because ChatHead is already responding."
+                                .to_owned(),
+                        ));
+                        let _ = runtime_for_send.voice.cancel();
+                        render_chat(&runtime_for_send);
+                        return;
+                    }
+                    let buffer = runtime_for_send.widgets.composer.buffer();
+                    let text = buffer.text(&buffer.start_iter(), &buffer.end_iter(), true);
+                    submit_text(&runtime_for_send, &text);
+                    if runtime_for_send.conversation.borrow().is_busy() {
+                        buffer.set_text("");
+                    }
+                    let _ = runtime_for_send.voice.complete_utterance(utterance_id);
+                    runtime_for_send.widgets.composer.grab_focus();
+                });
+            });
+        }
+        VoiceEvent::AutoFinalized => PANEL_RUNTIME.with(|stored| {
+            if let Some(runtime) = stored.borrow().as_ref() {
+                runtime
+                    .widgets
+                    .message
+                    .set_label("30-second limit reached. Transcribing locally…");
+            }
+        }),
+        VoiceEvent::LevelChanged { .. } => {}
+    }
+}
+
+fn should_auto_send_voice(mode: VoiceSubmissionMode) -> bool {
+    mode == VoiceSubmissionMode::InsertAndSend
+}
+
+fn render_voice_snapshot(snapshot: &VoiceSnapshot) {
+    OVERLAY_RUNTIME.with(|stored| {
+        if let Some(runtime) = stored.borrow().as_ref() {
+            let next = if snapshot.phase == VoicePhase::Listening {
+                VoiceState::Listening
+            } else {
+                VoiceState::Idle
+            };
+            if runtime.state.voice_state.replace(next) != next {
+                runtime.state.voice_changed_at.set(Instant::now());
+                start_or_continue_animation(&runtime.chathead, &runtime.state);
+            }
+        }
+    });
+    PANEL_RUNTIME.with(|stored| {
+        let runtime_ref = stored.borrow();
+        let Some(runtime) = runtime_ref.as_ref() else {
+            return;
+        };
+        let show_message = matches!(
+            snapshot.phase,
+            VoicePhase::Disabled
+                | VoicePhase::SetupRequired
+                | VoicePhase::Downloading
+                | VoicePhase::Loading
+                | VoicePhase::Error
+        );
+        runtime
+            .widgets
+            .message
+            .set_label(snapshot.message.as_deref().unwrap_or(""));
+        runtime.widgets.message.set_visible(show_message);
+        runtime.widgets.open_settings.set_visible(matches!(
+            snapshot.phase,
+            VoicePhase::Disabled | VoicePhase::SetupRequired | VoicePhase::Error
+        ));
+    });
+}
+
+fn update_shortcut_message(message: &gtk::Label, state: &OverlayState) {
     match state.voice_state.get() {
         VoiceState::Listening => {
-            status.set_label("Listening");
-            status.set_css_classes(&["status", "status-listening"]);
-            message.set_label(
-                "Listening mode is active. Press the voice shortcut again, or press Esc in this panel to stop.",
-            );
+            message.set_label("");
+            message.set_visible(false);
         }
         VoiceState::Idle => match &*state.shortcut_status.borrow() {
             ShortcutStatus::Registering => {
-                status.set_label("Shortcut...");
-                status.set_css_classes(&["status"]);
-                message.set_label(&format!(
-                    "Voice toggle is registering through the XDG portal. Preferred shortcut: {VOICE_TOGGLE_LABEL}."
-                ));
+                message.set_label("");
+                message.set_visible(false);
             }
-            ShortcutStatus::Ready(trigger) => {
-                status.set_label("Ready");
-                status.set_css_classes(&["status"]);
-                message.set_label(&format!(
-                    "Voice toggle: {trigger}. Press it to wake listening mode."
-                ));
+            ShortcutStatus::Ready(_) => {
+                message.set_label("");
+                message.set_visible(false);
             }
             ShortcutStatus::ConflictPossible(details) => {
-                status.set_label("Shortcut warning");
-                status.set_css_classes(&["status", "status-warning"]);
                 message.set_label(details);
+                message.set_visible(true);
             }
             ShortcutStatus::Unavailable(details) => {
-                status.set_label("Shortcut off");
-                status.set_css_classes(&["status", "status-error"]);
                 message.set_label(details);
+                message.set_visible(true);
             }
         },
     }
@@ -928,13 +2038,44 @@ fn attach_local_key_controller(panel: &gtk::Box, sender: mpsc::Sender<AppEvent>)
     let key = gtk::EventControllerKey::new();
     key.connect_key_pressed(move |_, key, _, _| {
         if key == gdk::Key::Escape {
-            let _ = sender.send(AppEvent::StopVoice);
+            let _ = sender.send(AppEvent::CancelVoice);
             return glib::Propagation::Stop;
         }
 
         glib::Propagation::Proceed
     });
     panel.add_controller(key);
+}
+
+fn attach_focus_dismiss_controller(
+    window: &gtk::ApplicationWindow,
+    canvas: &gtk::Fixed,
+    state: &OverlayState,
+) {
+    let click = gtk::GestureClick::new();
+    click.set_button(0);
+    click.set_propagation_phase(gtk::PropagationPhase::Capture);
+
+    let window_for_press = window.clone();
+    let state_for_press = state.clone();
+    click.connect_pressed(move |_, _, x, y| {
+        let panel_hit = window_for_press.surface().is_some_and(|surface| {
+            point_is_in_panel(x, y, surface.width(), surface.height(), &state_for_press)
+        });
+        if !state_for_press.panel_open.get()
+            || !state_for_press.panel_keyboard_captured.get()
+            || point_is_in_chathead(x, y, &state_for_press)
+            || panel_hit
+        {
+            return;
+        }
+
+        state_for_press.panel_keyboard_captured.set(false);
+        window_for_press.set_keyboard_mode(KeyboardMode::OnDemand);
+        apply_idle_input_region(&window_for_press, &state_for_press);
+    });
+
+    canvas.add_controller(click);
 }
 
 fn attach_drag_controller(
@@ -949,6 +2090,8 @@ fn attach_drag_controller(
     drag.set_propagation_phase(gtk::PropagationPhase::Capture);
 
     let window_for_begin = window.clone();
+    let canvas_for_begin = canvas.clone();
+    let chathead_for_begin = chathead.clone();
     let state_for_begin = state.clone();
     drag.connect_drag_begin(move |_, start_x, start_y| {
         if !point_is_in_chathead(start_x, start_y, &state_for_begin) {
@@ -957,8 +2100,11 @@ fn attach_drag_controller(
         }
 
         state_for_begin.dragging_chathead.set(true);
+        state_for_begin.panel_rect_override.set(None);
         state_for_begin.drag_start_x.set(state_for_begin.x.get());
         state_for_begin.drag_start_y.set(state_for_begin.y.get());
+        canvas_for_begin.set_cursor_from_name(Some("grabbing"));
+        chathead_for_begin.set_cursor_from_name(Some("grabbing"));
         set_full_input_region(&window_for_begin);
     });
 
@@ -998,14 +2144,7 @@ fn attach_drag_controller(
 
         let distance = offset_x.abs() + offset_y.abs();
         if distance < CLICK_THRESHOLD {
-            let open = !state_for_end.panel_open.get();
-            state_for_end.panel_open.set(open);
-            panel_for_end.set_visible(open);
-            window_for_end.set_keyboard_mode(if open {
-                KeyboardMode::OnDemand
-            } else {
-                KeyboardMode::None
-            });
+            toggle_panel();
         }
 
         clamp_position(&canvas_for_end, &state_for_end);
@@ -1015,19 +2154,369 @@ fn attach_drag_controller(
             &panel_for_end,
             &state_for_end,
         );
+        canvas_for_end.set_cursor(None);
+        chathead_for_end.set_cursor_from_name(Some("pointer"));
         apply_idle_input_region(&window_for_end, &state_for_end);
     });
 
     let window_for_cancel = window.clone();
+    let canvas_for_cancel = canvas.clone();
+    let chathead_for_cancel = chathead.clone();
     let state_for_cancel = state.clone();
     drag.connect_cancel(move |_, _| {
         if state_for_cancel.dragging_chathead.replace(false) {
+            canvas_for_cancel.set_cursor(None);
+            chathead_for_cancel.set_cursor_from_name(Some("pointer"));
             apply_idle_input_region(&window_for_cancel, &state_for_cancel);
         }
     });
 
     canvas.add_controller(drag);
     chathead.set_can_focus(false);
+}
+
+#[derive(Clone, Copy)]
+struct ResizeSession {
+    edge: ResizeEdge,
+    start: PanelRect,
+    anchor: TranscriptAnchor,
+}
+
+fn attach_panel_resize_controller(
+    window: &gtk::ApplicationWindow,
+    canvas: &gtk::Fixed,
+    runtime: &PanelRuntime,
+    state: &OverlayState,
+) {
+    let session = Rc::new(Cell::new(None::<ResizeSession>));
+    let motion = gtk::EventControllerMotion::new();
+    motion.set_propagation_phase(gtk::PropagationPhase::Capture);
+    let panel_for_motion = runtime.widgets.container.clone();
+    let session_for_motion = session.clone();
+    motion.connect_motion(move |_, x, y| {
+        if session_for_motion.get().is_some() {
+            return;
+        }
+        let edge = resize_edge_at(
+            x,
+            y,
+            panel_for_motion.allocated_width(),
+            panel_for_motion.allocated_height(),
+        );
+        panel_for_motion.set_cursor_from_name(edge.map(ResizeEdge::cursor_name));
+        if edge.is_some() {
+            panel_for_motion.add_css_class("resize-ready");
+        } else {
+            panel_for_motion.remove_css_class("resize-ready");
+        }
+    });
+    let panel_for_leave = runtime.widgets.container.clone();
+    let session_for_leave = session.clone();
+    motion.connect_leave(move |_| {
+        if session_for_leave.get().is_none() {
+            panel_for_leave.set_cursor(None);
+            panel_for_leave.remove_css_class("resize-ready");
+        }
+    });
+    runtime.widgets.container.add_controller(motion);
+
+    let drag = gtk::GestureDrag::new();
+    drag.set_button(gdk::BUTTON_PRIMARY);
+    drag.set_propagation_phase(gtk::PropagationPhase::Capture);
+
+    let window_for_begin = window.clone();
+    let canvas_for_begin = canvas.clone();
+    let runtime_for_begin = runtime.clone();
+    let state_for_begin = state.clone();
+    let session_for_begin = session.clone();
+    drag.connect_drag_begin(move |gesture, start_x, start_y| {
+        let Some(edge) = resize_edge_at(
+            start_x,
+            start_y,
+            runtime_for_begin.widgets.container.allocated_width(),
+            runtime_for_begin.widgets.container.allocated_height(),
+        ) else {
+            return;
+        };
+        let _ = gesture.set_state(gtk::EventSequenceState::Claimed);
+        let start = visible_panel_rect(
+            canvas_for_begin.allocated_width(),
+            canvas_for_begin.allocated_height(),
+            &state_for_begin,
+        );
+        state_for_begin.panel_rect_override.set(Some(start));
+        session_for_begin.set(Some(ResizeSession {
+            edge,
+            start,
+            anchor: TranscriptAnchor::capture(&runtime_for_begin.widgets.transcript_scroll),
+        }));
+        runtime_for_begin
+            .widgets
+            .container
+            .add_css_class("resizing");
+        runtime_for_begin
+            .widgets
+            .container
+            .set_cursor_from_name(Some(edge.cursor_name()));
+        set_full_input_region(&window_for_begin);
+    });
+
+    let canvas_for_update = canvas.clone();
+    let runtime_for_update = runtime.clone();
+    let state_for_update = state.clone();
+    let session_for_update = session.clone();
+    drag.connect_drag_update(move |_, offset_x, offset_y| {
+        let Some(active) = session_for_update.get() else {
+            return;
+        };
+        let rect = resized_panel_rect(
+            active.start,
+            active.edge,
+            offset_x,
+            offset_y,
+            canvas_for_update.allocated_width(),
+            canvas_for_update.allocated_height(),
+        );
+        apply_resize_rect(
+            &canvas_for_update,
+            &runtime_for_update,
+            &state_for_update,
+            rect,
+        );
+    });
+
+    let window_for_end = window.clone();
+    let canvas_for_end = canvas.clone();
+    let runtime_for_end = runtime.clone();
+    let state_for_end = state.clone();
+    let session_for_end = session.clone();
+    drag.connect_drag_end(move |_, offset_x, offset_y| {
+        let Some(active) = session_for_end.take() else {
+            return;
+        };
+        let rect = resized_panel_rect(
+            active.start,
+            active.edge,
+            offset_x,
+            offset_y,
+            canvas_for_end.allocated_width(),
+            canvas_for_end.allocated_height(),
+        );
+        apply_resize_rect(&canvas_for_end, &runtime_for_end, &state_for_end, rect);
+        runtime_for_end
+            .widgets
+            .container
+            .remove_css_class("resizing");
+        runtime_for_end
+            .widgets
+            .container
+            .remove_css_class("resize-ready");
+        runtime_for_end.widgets.container.set_cursor(None);
+        restore_transcript_anchor(active.anchor, &runtime_for_end.widgets.transcript_scroll);
+        apply_idle_input_region(&window_for_end, &state_for_end);
+        emit_panel_size_changed(rect.size());
+    });
+
+    let window_for_cancel = window.clone();
+    let canvas_for_cancel = canvas.clone();
+    let runtime_for_cancel = runtime.clone();
+    let state_for_cancel = state.clone();
+    let session_for_cancel = session;
+    drag.connect_cancel(move |_, _| {
+        let Some(active) = session_for_cancel.take() else {
+            return;
+        };
+        apply_resize_rect(
+            &canvas_for_cancel,
+            &runtime_for_cancel,
+            &state_for_cancel,
+            active.start,
+        );
+        runtime_for_cancel
+            .widgets
+            .container
+            .remove_css_class("resizing");
+        runtime_for_cancel
+            .widgets
+            .container
+            .remove_css_class("resize-ready");
+        runtime_for_cancel.widgets.container.set_cursor(None);
+        restore_transcript_anchor(active.anchor, &runtime_for_cancel.widgets.transcript_scroll);
+        apply_idle_input_region(&window_for_cancel, &state_for_cancel);
+    });
+
+    runtime.widgets.container.add_controller(drag);
+}
+
+fn apply_resize_rect(
+    canvas: &gtk::Fixed,
+    runtime: &PanelRuntime,
+    state: &OverlayState,
+    rect: PanelRect,
+) {
+    let size = rect.size();
+    state.panel_size.set(size);
+    state.panel_rect_override.set(Some(rect));
+    store_panel_size(size);
+    apply_panel_dimensions(runtime, size);
+    canvas.move_(&runtime.widgets.container, rect.x, rect.y);
+}
+
+fn restore_transcript_anchor(anchor: TranscriptAnchor, scroll: &gtk::ScrolledWindow) {
+    let adjustment = scroll.vadjustment();
+    glib::idle_add_local_once(move || anchor.restore(&adjustment));
+}
+
+fn emit_panel_size_changed(size: PanelSize) {
+    PANEL_RUNTIME.with(|stored| {
+        if let Some(runtime) = stored.borrow().as_ref() {
+            super::write_message(
+                &runtime.output,
+                &IpcEvent {
+                    protocol_version: PROTOCOL_VERSION,
+                    event: "panelSizeChanged",
+                    payload: size,
+                },
+            );
+        }
+    });
+}
+
+fn resize_edge_at(x: f64, y: f64, width: i32, height: i32) -> Option<ResizeEdge> {
+    let width = f64::from(width);
+    let height = f64::from(height);
+    let left_corner = x <= RESIZE_CORNER_HIT_ZONE;
+    let right_corner = x >= width - RESIZE_CORNER_HIT_ZONE;
+    let top_corner = y <= RESIZE_CORNER_HIT_ZONE;
+    let bottom_corner = y >= height - RESIZE_CORNER_HIT_ZONE;
+    if left_corner && top_corner {
+        return Some(ResizeEdge::NorthWest);
+    }
+    if right_corner && top_corner {
+        return Some(ResizeEdge::NorthEast);
+    }
+    if right_corner && bottom_corner {
+        return Some(ResizeEdge::SouthEast);
+    }
+    if left_corner && bottom_corner {
+        return Some(ResizeEdge::SouthWest);
+    }
+    if y <= RESIZE_EDGE_HIT_ZONE {
+        Some(ResizeEdge::North)
+    } else if x >= width - RESIZE_EDGE_HIT_ZONE {
+        Some(ResizeEdge::East)
+    } else if y >= height - RESIZE_EDGE_HIT_ZONE {
+        Some(ResizeEdge::South)
+    } else if x <= RESIZE_EDGE_HIT_ZONE {
+        Some(ResizeEdge::West)
+    } else {
+        None
+    }
+}
+
+fn effective_panel_size(requested: PanelSize, output_width: i32, output_height: i32) -> PanelSize {
+    let width_cap = (output_width - EDGE_PADDING * 2)
+        .clamp(i32::from(PANEL_WIDTH_MIN), i32::from(PANEL_WIDTH_MAX));
+    let height_cap = (output_height - EDGE_PADDING * 2)
+        .clamp(i32::from(PANEL_HEIGHT_MIN), i32::from(PANEL_HEIGHT_MAX));
+    PanelSize::try_new(
+        requested
+            .width()
+            .min(u16::try_from(width_cap).expect("positive width cap")),
+        requested
+            .height()
+            .min(u16::try_from(height_cap).expect("positive height cap")),
+    )
+    .expect("effective panel size stays within validated bounds")
+}
+
+fn resized_panel_rect(
+    start: PanelRect,
+    edge: ResizeEdge,
+    offset_x: f64,
+    offset_y: f64,
+    output_width: i32,
+    output_height: i32,
+) -> PanelRect {
+    let maximum = effective_panel_size(
+        PanelSize::try_new(PANEL_WIDTH_MAX, PANEL_HEIGHT_MAX).expect("maximum panel size"),
+        output_width,
+        output_height,
+    );
+    let min_width = f64::from(PANEL_WIDTH_MIN);
+    let min_height = f64::from(PANEL_HEIGHT_MIN);
+    let max_width = f64::from(maximum.width());
+    let max_height = f64::from(maximum.height());
+    let mut left = start.x;
+    let mut right = start.x + f64::from(start.width);
+    let mut top = start.y;
+    let mut bottom = start.y + f64::from(start.height);
+
+    if edge.moves_left() {
+        let upper = right - min_width;
+        let lower = f64::from(EDGE_PADDING).max(right - max_width).min(upper);
+        left = (start.x + offset_x).clamp(lower, upper);
+    } else if edge.moves_right() {
+        let lower = left + min_width;
+        let upper = f64::from(output_width - EDGE_PADDING)
+            .min(left + max_width)
+            .max(lower);
+        right = (start.x + f64::from(start.width) + offset_x).clamp(lower, upper);
+    }
+    if edge.moves_top() {
+        let upper = bottom - min_height;
+        let lower = f64::from(EDGE_PADDING).max(bottom - max_height).min(upper);
+        top = (start.y + offset_y).clamp(lower, upper);
+    } else if edge.moves_bottom() {
+        let lower = top + min_height;
+        let upper = f64::from(output_height - EDGE_PADDING)
+            .min(top + max_height)
+            .max(lower);
+        bottom = (start.y + f64::from(start.height) + offset_y).clamp(lower, upper);
+    }
+
+    PanelRect {
+        x: left.round(),
+        y: top.round(),
+        width: (right - left).round() as i32,
+        height: (bottom - top).round() as i32,
+    }
+}
+
+fn attach_hover_cursor(canvas: &gtk::Fixed, state: &OverlayState) {
+    let motion = gtk::EventControllerMotion::new();
+    motion.set_propagation_phase(gtk::PropagationPhase::Capture);
+
+    let canvas_for_motion = canvas.clone();
+    let state_for_motion = state.clone();
+    motion.connect_motion(move |_, x, y| {
+        if state_for_motion.dragging_chathead.get() {
+            canvas_for_motion.set_cursor_from_name(Some("grabbing"));
+        } else if point_is_in_chathead(x, y, &state_for_motion) {
+            canvas_for_motion.set_cursor_from_name(Some("pointer"));
+        } else {
+            canvas_for_motion.set_cursor(None);
+        }
+    });
+
+    let canvas_for_leave = canvas.clone();
+    let state_for_leave = state.clone();
+    motion.connect_leave(move |_| {
+        if !state_for_leave.dragging_chathead.get() {
+            canvas_for_leave.set_cursor(None);
+        }
+    });
+
+    canvas.add_controller(motion);
+}
+
+fn focus_composer_when_mapped(composer: &gtk::TextView) {
+    let weak_composer = glib::object::ObjectExt::downgrade(composer);
+    glib::idle_add_local_once(move || {
+        if let Some(composer) = weak_composer.upgrade() {
+            composer.grab_focus();
+        }
+    });
 }
 
 fn start_shortcut_service(sender: mpsc::Sender<AppEvent>) {
@@ -1041,9 +2530,12 @@ fn start_shortcut_service(sender: mpsc::Sender<AppEvent>) {
             match runtime {
                 Ok(runtime) => runtime.block_on(run_shortcut_service(sender)),
                 Err(error) => {
-                    let _ = sender.send(AppEvent::ShortcutStatus(ShortcutStatus::Unavailable(
-                        format!("Global shortcut runtime failed: {error}."),
-                    )));
+                    send_all_shortcut_statuses(
+                        &sender,
+                        ShortcutStatus::Unavailable(format!(
+                            "Global shortcut runtime failed: {error}."
+                        )),
+                    );
                 }
             }
         })
@@ -1053,19 +2545,27 @@ fn start_shortcut_service(sender: mpsc::Sender<AppEvent>) {
 }
 
 async fn run_shortcut_service(sender: mpsc::Sender<AppEvent>) {
-    if sender
-        .send(AppEvent::ShortcutStatus(ShortcutStatus::Registering))
-        .is_err()
-    {
+    if !send_all_shortcut_statuses(&sender, ShortcutStatus::Registering) {
         return;
     }
 
     let result = register_and_listen_for_shortcuts(sender.clone()).await;
     if let Err(error) = result {
-        let _ = sender.send(AppEvent::ShortcutStatus(ShortcutStatus::Unavailable(
-            format!("Global shortcut unavailable: {error}."),
-        )));
+        send_all_shortcut_statuses(
+            &sender,
+            ShortcutStatus::Unavailable(format!("Global shortcut unavailable: {error}.")),
+        );
     }
+}
+
+fn send_all_shortcut_statuses(sender: &mpsc::Sender<AppEvent>, status: ShortcutStatus) -> bool {
+    [ShortcutAction::Voice, ShortcutAction::Panel]
+        .into_iter()
+        .all(|action| {
+            sender
+                .send(AppEvent::ShortcutStatus(action, status.clone()))
+                .is_ok()
+        })
 }
 
 async fn register_and_listen_for_shortcuts(
@@ -1076,58 +2576,88 @@ async fn register_and_listen_for_shortcuts(
         .create_session(CreateSessionOptions::default())
         .await?;
     let activated = portal.receive_activated().await?;
-    let shortcuts = [NewShortcut::new(VOICE_TOGGLE_ID, "Toggle voice listening")
-        .preferred_trigger(Some(VOICE_TOGGLE_TRIGGER))];
+    let deactivated = portal.receive_deactivated().await?;
+    let shortcuts = [
+        NewShortcut::new(VOICE_TOGGLE_ID, "Start or stop local voice input")
+            .preferred_trigger(Some(VOICE_TOGGLE_TRIGGER)),
+        NewShortcut::new(PANEL_TOGGLE_ID, "Toggle the chat panel")
+            .preferred_trigger(Some(PANEL_TOGGLE_TRIGGER)),
+    ];
 
     let request = portal
         .bind_shortcuts(&session, &shortcuts, None, BindShortcutsOptions::default())
         .await?;
     let response = request.response()?;
-    let trigger = response
-        .shortcuts()
-        .iter()
-        .find(|shortcut| shortcut.id() == VOICE_TOGGLE_ID)
-        .map(|shortcut| shortcut.trigger_description().trim())
-        .filter(|trigger| !trigger.is_empty())
-        .unwrap_or(VOICE_TOGGLE_LABEL);
-
-    if response
-        .shortcuts()
-        .iter()
-        .any(|shortcut| shortcut.id() == VOICE_TOGGLE_ID)
-    {
+    for (action, id, fallback_label, action_label) in [
+        (
+            ShortcutAction::Voice,
+            VOICE_TOGGLE_ID,
+            VOICE_TOGGLE_LABEL,
+            "voice shortcut",
+        ),
+        (
+            ShortcutAction::Panel,
+            PANEL_TOGGLE_ID,
+            PANEL_TOGGLE_LABEL,
+            "panel shortcut",
+        ),
+    ] {
+        let status = response
+            .shortcuts()
+            .iter()
+            .find(|shortcut| shortcut.id() == id)
+            .map_or_else(
+                || {
+                    ShortcutStatus::ConflictPossible(format!(
+                        "The {action_label} was not bound by the desktop portal. Configure the compositor to route it to ChatHead AI."
+                    ))
+                },
+                |shortcut| {
+                    let trigger = shortcut.trigger_description().trim();
+                    ShortcutStatus::Ready(if trigger.is_empty() {
+                        fallback_label.to_owned()
+                    } else {
+                        trigger.to_owned()
+                    })
+                },
+            );
         if sender
-            .send(AppEvent::ShortcutStatus(ShortcutStatus::Ready(
-                trigger.to_owned(),
-            )))
+            .send(AppEvent::ShortcutStatus(action, status))
             .is_err()
         {
             return Ok(());
         }
-    } else if sender
-        .send(AppEvent::ShortcutStatus(ShortcutStatus::ConflictPossible(
-            "The voice shortcut was not bound by the desktop portal. Choose another shortcut or configure your compositor to route it to ChatHead AI.".to_owned(),
-        )))
-        .is_err()
-    {
-        return Ok(());
     }
 
-    futures_util::pin_mut!(activated);
-    let mut last_activation = Instant::now() - Duration::from_millis(SHORTCUT_DEBOUNCE_MS);
-    while let Some(event) = activated.next().await {
-        if event.shortcut_id() != VOICE_TOGGLE_ID {
-            continue;
-        }
-
-        let now = Instant::now();
-        if now.duration_since(last_activation) < Duration::from_millis(SHORTCUT_DEBOUNCE_MS) {
-            continue;
-        }
-        last_activation = now;
-
-        if sender.send(AppEvent::ToggleVoice).is_err() {
-            break;
+    let activated = activated.fuse();
+    let deactivated = deactivated.fuse();
+    futures_util::pin_mut!(activated, deactivated);
+    loop {
+        futures_util::select! {
+            event = activated.next() => {
+                let Some(event) = event else { break };
+                match event.shortcut_id() {
+                    VOICE_TOGGLE_ID => {
+                        if sender.send(AppEvent::VoiceShortcutActivated).is_err() {
+                            break;
+                        }
+                    }
+                    PANEL_TOGGLE_ID => {
+                        if sender.send(AppEvent::TogglePanel).is_err() {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            },
+            event = deactivated.next() => {
+                let Some(event) = event else { break };
+                if event.shortcut_id() == VOICE_TOGGLE_ID
+                    && sender.send(AppEvent::VoiceShortcutDeactivated).is_err()
+                {
+                    break;
+                }
+            },
         }
     }
 
@@ -1156,27 +2686,12 @@ fn position_widgets(
     panel: &gtk::Box,
     state: &OverlayState,
 ) {
-    let (panel_x, panel_y) =
-        panel_position(canvas.allocated_width(), canvas.allocated_height(), state);
-    canvas.move_(panel, panel_x, panel_y);
+    let rect = visible_panel_rect(canvas.allocated_width(), canvas.allocated_height(), state);
+    canvas.move_(panel, rect.x, rect.y);
     canvas.move_(chathead, state.x.get(), state.y.get());
 }
 
-fn preferred_x(width: i32, position: OverlayPosition) -> f64 {
-    let max_x = (width - CHATHEAD_SIZE).max(0);
-    match position {
-        OverlayPosition::Left => EDGE_PADDING.min(max_x),
-        OverlayPosition::Right => (max_x - EDGE_PADDING).max(0),
-    }
-    .into()
-}
-
-fn apply_preferred_position(runtime: &PositionRuntime, position: OverlayPosition) {
-    runtime
-        .state
-        .x
-        .set(preferred_x(runtime.canvas.allocated_width(), position));
-    clamp_position(&runtime.canvas, &runtime.state);
+fn apply_panel_position(runtime: &OverlayRuntime) {
     position_widgets(
         &runtime.canvas,
         &runtime.chathead,
@@ -1495,32 +3010,66 @@ fn rounded_rect(context: &cairo::Context, x: f64, y: f64, width: f64, height: f6
     context.close_path();
 }
 
-fn panel_position(width: i32, height: i32, state: &OverlayState) -> (f64, f64) {
-    let width = width.max(PANEL_WIDTH + EDGE_PADDING * 2);
-    let height = height.max(PANEL_HEIGHT + EDGE_PADDING * 2);
-    let x = if state.x.get() + PANEL_WIDTH as f64 <= width as f64 {
-        state.x.get()
+fn visible_panel_rect(width: i32, height: i32, state: &OverlayState) -> PanelRect {
+    state.panel_rect_override.get().unwrap_or_else(|| {
+        let size = state.panel_size.get();
+        let (x, y) = panel_position_for(width, height, state, PanelPosition::current());
+        PanelRect {
+            x,
+            y,
+            width: i32::from(size.width()),
+            height: i32::from(size.height()),
+        }
+    })
+}
+
+fn panel_position_for(
+    width: i32,
+    height: i32,
+    state: &OverlayState,
+    preferred_position: PanelPosition,
+) -> (f64, f64) {
+    let size = state.panel_size.get();
+    let panel_width = i32::from(size.width());
+    let panel_height = i32::from(size.height());
+    let width = width.max(panel_width + EDGE_PADDING * 2);
+    let height = height.max(panel_height + EDGE_PADDING * 2);
+    let preferred_x = panel_x_for(state.x.get(), preferred_position, panel_width);
+    let x = if panel_fits_horizontally(preferred_x, width, panel_width) {
+        preferred_x
     } else {
-        state.x.get() + CHATHEAD_SIZE as f64 - PANEL_WIDTH as f64
+        panel_x_for(state.x.get(), preferred_position.opposite(), panel_width)
     };
-    let y = if state.y.get() + CHATHEAD_SIZE as f64 + PANEL_GAP as f64 + PANEL_HEIGHT as f64
+    let y = if state.y.get() + CHATHEAD_SIZE as f64 + PANEL_GAP as f64 + f64::from(panel_height)
         <= height as f64
     {
         state.y.get() + CHATHEAD_SIZE as f64 + PANEL_GAP as f64
     } else {
-        state.y.get() - PANEL_HEIGHT as f64 - PANEL_GAP as f64
+        state.y.get() - f64::from(panel_height) - PANEL_GAP as f64
     };
 
     (
         x.clamp(
             EDGE_PADDING as f64,
-            (width - PANEL_WIDTH - EDGE_PADDING).max(0) as f64,
+            (width - panel_width - EDGE_PADDING).max(0) as f64,
         ),
         y.clamp(
             EDGE_PADDING as f64,
-            (height - PANEL_HEIGHT - EDGE_PADDING).max(0) as f64,
+            (height - panel_height - EDGE_PADDING).max(0) as f64,
         ),
     )
+}
+
+fn panel_x_for(chathead_x: f64, position: PanelPosition, panel_width: i32) -> f64 {
+    match position {
+        PanelPosition::Left => chathead_x + f64::from(CHATHEAD_SIZE - panel_width),
+        PanelPosition::Right => chathead_x,
+    }
+}
+
+fn panel_fits_horizontally(panel_x: f64, width: i32, panel_width: i32) -> bool {
+    panel_x >= f64::from(EDGE_PADDING)
+        && panel_x + f64::from(panel_width) <= f64::from(width - EDGE_PADDING)
 }
 
 fn set_full_input_region(window: &gtk::ApplicationWindow) {
@@ -1534,6 +3083,11 @@ fn apply_idle_input_region(window: &gtk::ApplicationWindow, state: &OverlayState
         return;
     };
 
+    if state.panel_open.get() && state.panel_keyboard_captured.get() {
+        surface.set_input_region(None);
+        return;
+    }
+
     let region = cairo::Region::create();
     let chathead_rect = cairo::RectangleInt::new(
         state.x.get().round() as i32,
@@ -1544,17 +3098,25 @@ fn apply_idle_input_region(window: &gtk::ApplicationWindow, state: &OverlayState
     let _ = region.union_rectangle(&chathead_rect);
 
     if state.panel_open.get() {
-        let (panel_x, panel_y) = panel_position(surface.width(), surface.height(), state);
+        let panel = visible_panel_rect(surface.width(), surface.height(), state);
         let panel_rect = cairo::RectangleInt::new(
-            panel_x.round() as i32,
-            panel_y.round() as i32,
-            PANEL_WIDTH,
-            PANEL_HEIGHT,
+            panel.x.round() as i32,
+            panel.y.round() as i32,
+            panel.width,
+            panel.height,
         );
         let _ = region.union_rectangle(&panel_rect);
     }
 
     surface.set_input_region(Some(&region));
+}
+
+fn point_is_in_panel(x: f64, y: f64, width: i32, height: i32, state: &OverlayState) -> bool {
+    let panel = visible_panel_rect(width, height, state);
+    x >= panel.x
+        && x <= panel.x + f64::from(panel.width)
+        && y >= panel.y
+        && y <= panel.y + f64::from(panel.height)
 }
 
 #[cfg(test)]
@@ -1566,11 +3128,12 @@ mod tests {
         let state = OverlayState::new();
         state.x.set(1900.0);
         state.y.set(1000.0);
-        let (x, y) = panel_position(1920, 1080, &state);
+        let (x, y) = panel_position_for(1920, 1080, &state, PanelPosition::Right);
+        let size = state.panel_size.get();
         assert!(x >= f64::from(EDGE_PADDING));
         assert!(y >= f64::from(EDGE_PADDING));
-        assert!(x + f64::from(PANEL_WIDTH) <= f64::from(1920 - EDGE_PADDING));
-        assert!(y + f64::from(PANEL_HEIGHT) <= f64::from(1080 - EDGE_PADDING));
+        assert!(x + f64::from(size.width()) <= f64::from(1920 - EDGE_PADDING));
+        assert!(y + f64::from(size.height()) <= f64::from(1080 - EDGE_PADDING));
     }
 
     #[test]
@@ -1583,14 +3146,160 @@ mod tests {
     }
 
     #[test]
-    fn preferred_position_respects_both_output_edges() {
-        assert_eq!(preferred_x(1920, OverlayPosition::Left), 12.0);
-        assert_eq!(preferred_x(1920, OverlayPosition::Right), 1824.0);
+    fn panel_position_places_the_panel_on_the_selected_side() {
+        let state = OverlayState::new();
+        state.x.set(800.0);
+
+        let (left_x, _) = panel_position_for(1920, 1080, &state, PanelPosition::Left);
+        let (right_x, _) = panel_position_for(1920, 1080, &state, PanelPosition::Right);
+
+        assert_eq!(left_x, 324.0);
+        assert_eq!(right_x, 800.0);
+        assert_eq!(state.x.get(), 800.0);
     }
 
     #[test]
-    fn preferred_position_handles_outputs_smaller_than_the_chathead() {
-        assert_eq!(preferred_x(60, OverlayPosition::Left), 0.0);
-        assert_eq!(preferred_x(60, OverlayPosition::Right), 0.0);
+    fn panel_position_flips_away_from_horizontal_edges() {
+        let state = OverlayState::new();
+
+        state.x.set(50.0);
+        let (left_x, _) = panel_position_for(1920, 1080, &state, PanelPosition::Left);
+        assert_eq!(left_x, 50.0);
+
+        state.x.set(1_700.0);
+        let (right_x, _) = panel_position_for(1920, 1080, &state, PanelPosition::Right);
+        assert_eq!(right_x, 1_224.0);
+    }
+
+    #[test]
+    fn panel_position_clamps_when_neither_side_fully_fits() {
+        let state = OverlayState::new();
+        state.x.set(1_900.0);
+
+        let (x, _) = panel_position_for(1920, 1080, &state, PanelPosition::Right);
+
+        assert_eq!(x, 1_344.0);
+    }
+
+    #[test]
+    fn pending_voice_submission_is_exactly_once() {
+        let mut pending = PendingVoice::default();
+        pending.arm(7);
+        assert!(pending.consume(7));
+        assert!(!pending.consume(7));
+    }
+
+    #[test]
+    fn canceled_or_stale_voice_submission_cannot_send() {
+        let mut pending = PendingVoice::default();
+        pending.arm(8);
+        assert!(!pending.consume(7));
+        assert!(pending.cancel());
+        assert!(!pending.consume(8));
+    }
+
+    #[test]
+    fn voice_send_delay_is_fixed_at_seven_hundred_milliseconds() {
+        assert_eq!(VOICE_SEND_DELAY, Duration::from_millis(700));
+    }
+
+    #[test]
+    fn voice_submission_mode_controls_automatic_send() {
+        assert!(!should_auto_send_voice(VoiceSubmissionMode::InsertOnly));
+        assert!(should_auto_send_voice(VoiceSubmissionMode::InsertAndSend));
+    }
+
+    #[test]
+    fn panel_metrics_scale_at_every_zoom_level() {
+        let metrics = chathead_core::PANEL_ZOOM_LEVELS.map(|level| {
+            PanelMetrics::for_zoom(PanelZoom::try_from(level).expect("valid panel zoom"))
+        });
+        for pair in metrics.windows(2) {
+            assert!(pair[0].panel_padding <= pair[1].panel_padding);
+            assert!(pair[0].body_font <= pair[1].body_font);
+            assert!(pair[0].composer_height <= pair[1].composer_height);
+        }
+        assert!(metrics[0].panel_padding < metrics[2].panel_padding);
+        assert!(metrics[5].panel_padding > metrics[2].panel_padding);
+    }
+
+    #[test]
+    fn panel_metrics_enforce_text_and_target_floors() {
+        let metrics = PanelMetrics::for_zoom(PanelZoom::try_from(80).expect("valid panel zoom"));
+        assert!(metrics.title_font >= 10);
+        assert!(metrics.body_font >= 10);
+        assert!(metrics.small_font >= 10);
+        assert!(metrics.compact_target >= 28);
+        assert!(metrics.send_target >= 28);
+    }
+
+    #[test]
+    fn panel_size_caps_follow_output_and_preserve_tiny_output_minimums() {
+        let maximum = PanelSize::try_new(960, 800).expect("maximum size");
+        assert_eq!(effective_panel_size(maximum, 1920, 1080), maximum);
+        assert_eq!(
+            effective_panel_size(maximum, 800, 600),
+            PanelSize::try_new(768, 568).expect("monitor-capped size")
+        );
+        assert_eq!(
+            effective_panel_size(maximum, 400, 440),
+            PanelSize::try_new(420, 460).expect("minimum size")
+        );
+    }
+
+    #[test]
+    fn resize_hit_testing_covers_every_edge_and_corner() {
+        let cases = [
+            ((1.0, 1.0), ResizeEdge::NorthWest),
+            ((280.0, 1.0), ResizeEdge::North),
+            ((559.0, 1.0), ResizeEdge::NorthEast),
+            ((559.0, 230.0), ResizeEdge::East),
+            ((559.0, 459.0), ResizeEdge::SouthEast),
+            ((280.0, 459.0), ResizeEdge::South),
+            ((1.0, 459.0), ResizeEdge::SouthWest),
+            ((1.0, 230.0), ResizeEdge::West),
+        ];
+        for (point, expected) in cases {
+            assert_eq!(resize_edge_at(point.0, point.1, 560, 460), Some(expected));
+        }
+        assert_eq!(resize_edge_at(280.0, 230.0, 560, 460), None);
+    }
+
+    #[test]
+    fn resizing_keeps_the_opposite_edges_fixed() {
+        let start = PanelRect {
+            x: 100.0,
+            y: 100.0,
+            width: 560,
+            height: 460,
+        };
+        let west = resized_panel_rect(start, ResizeEdge::West, -50.0, 0.0, 1920, 1080);
+        assert_eq!(west.x, 50.0);
+        assert_eq!(west.width, 610);
+        assert_eq!(west.x + f64::from(west.width), 660.0);
+
+        let north = resized_panel_rect(start, ResizeEdge::North, 0.0, -50.0, 1920, 1080);
+        assert_eq!(north.y, 50.0);
+        assert_eq!(north.height, 510);
+        assert_eq!(north.y + f64::from(north.height), 560.0);
+    }
+
+    #[test]
+    fn resizing_clamps_at_minimum_maximum_and_output_edges() {
+        let start = PanelRect {
+            x: 100.0,
+            y: 100.0,
+            width: 560,
+            height: 460,
+        };
+        let minimum = resized_panel_rect(start, ResizeEdge::West, 500.0, 0.0, 1920, 1080);
+        assert_eq!(minimum.width, 420);
+        assert_eq!(minimum.x + f64::from(minimum.width), 660.0);
+
+        let maximum =
+            resized_panel_rect(start, ResizeEdge::SouthEast, 2_000.0, 2_000.0, 1920, 1080);
+        assert_eq!((maximum.width, maximum.height), (960, 800));
+        assert!(maximum.x + f64::from(maximum.width) <= f64::from(1920 - EDGE_PADDING));
+        assert!(maximum.y + f64::from(maximum.height) <= f64::from(1080 - EDGE_PADDING));
     }
 }

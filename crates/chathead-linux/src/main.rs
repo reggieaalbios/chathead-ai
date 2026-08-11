@@ -7,13 +7,17 @@ use std::{
 
 use chathead_core::{
     Backend, CodexAppServer, CodexCommand, CodexEvent, ErrorCode, IpcError, IpcEvent, IpcRequest,
-    IpcResponse, LaunchReadiness, PROTOCOL_VERSION, ProviderId,
+    IpcResponse, LaunchReadiness, PROTOCOL_VERSION, PanelSize, PanelZoom, ProviderId,
+    VoiceInteractionMode, VoiceModelId, VoiceSubmissionMode,
 };
+use chathead_voice::{VoiceEvent, VoiceService};
 use gtk::{gio, glib, prelude::*};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 mod overlay;
+mod response_format;
+mod response_view;
 
 const APP_ID: &str = "io.github.chathead_ai.ChatHead.Sidecar";
 const IPC_POLL_MS: u64 = 20;
@@ -45,8 +49,50 @@ struct OverlayThemeParams {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct OverlayPositionParams {
-    position: overlay::OverlayPosition,
+struct PanelPositionParams {
+    position: overlay::PanelPosition,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PanelZoomParams {
+    zoom: PanelZoom,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PanelSizeParams {
+    size: PanelSize,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct VoiceEnabledParams {
+    enabled: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct VoiceInputDeviceParams {
+    device_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct VoiceInteractionModeParams {
+    mode: VoiceInteractionMode,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct VoiceSubmissionModeParams {
+    mode: VoiceSubmissionMode,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct VoiceModelParams {
+    model_id: VoiceModelId,
 }
 
 type Output = Arc<Mutex<BufWriter<io::Stdout>>>;
@@ -65,9 +111,14 @@ fn start_sidecar(app: &gtk::Application) {
     let application_hold = app.hold();
 
     let backend = Arc::new(Mutex::new(Backend::new()));
+    let voice = VoiceService::start();
+    if let Ok(mut state) = backend.lock() {
+        state.set_voice_snapshot(voice.snapshot());
+    }
     let codex = CodexAppServer::start();
     let output = Arc::new(Mutex::new(BufWriter::new(io::stdout())));
     let (sender, receiver) = mpsc::channel();
+    let (shortcut_status_sender, shortcut_status_receiver) = mpsc::channel();
     start_stdin_reader(sender);
 
     if let Ok(state) = backend.lock() {
@@ -86,7 +137,15 @@ fn start_sidecar(app: &gtk::Application) {
         let _keep_application_alive = &application_hold;
         while let Ok(input) = receiver.try_recv() {
             match input {
-                Input::Request(request) => handle_request(&app, &backend, &codex, &output, request),
+                Input::Request(request) => handle_request(
+                    &app,
+                    &backend,
+                    &codex,
+                    &voice,
+                    &output,
+                    &shortcut_status_sender,
+                    request,
+                ),
                 Input::Malformed(message) => write_message(
                     &output,
                     &IpcResponse::<Value>::failure(
@@ -107,6 +166,22 @@ fn start_sidecar(app: &gtk::Application) {
         }
         while let Some(event) = codex.try_recv() {
             handle_codex_event(&app, &backend, &output, event);
+        }
+        while let Some(event) = voice.try_recv() {
+            handle_voice_event(&app, &backend, &output, event);
+        }
+        while let Ok(shortcut_status) = shortcut_status_receiver.try_recv() {
+            if let Ok(mut state) = backend.lock() {
+                match shortcut_status.action {
+                    overlay::ShortcutAction::Voice => {
+                        state.set_shortcut_status(shortcut_status.status);
+                    }
+                    overlay::ShortcutAction::Panel => {
+                        state.set_panel_shortcut_status(shortcut_status.status);
+                    }
+                }
+                write_snapshot_changed(&output, state.snapshot());
+            }
         }
         glib::ControlFlow::Continue
     });
@@ -140,7 +215,9 @@ fn handle_request(
     app: &gtk::Application,
     backend: &Arc<Mutex<Backend>>,
     codex: &CodexAppServer,
+    voice: &VoiceService,
     output: &Output,
+    shortcut_status_sender: &mpsc::Sender<overlay::ShortcutStatusUpdate>,
     request: IpcRequest,
 ) {
     if request.protocol_version != PROTOCOL_VERSION {
@@ -158,6 +235,7 @@ fn handle_request(
     }
 
     let id = request.id;
+    let publish_response_snapshot = publishes_response_snapshot(&request.method);
     let result = match request.method.as_str() {
         "getSnapshot" => backend
             .lock()
@@ -231,7 +309,14 @@ fn handle_request(
                     })
                 }
                 Ok(snapshot) => {
-                    overlay::start_native_overlay(app, codex.clone(), snapshot.experimental_chat)
+                    overlay::start_native_overlay(
+                        app,
+                        codex.clone(),
+                        snapshot.experimental_chat,
+                        voice.clone(),
+                        output.clone(),
+                        shortcut_status_sender.clone(),
+                    )
                 }
                 .map_err(|message| IpcError {
                     code: ErrorCode::LayerShellUnsupported,
@@ -266,8 +351,118 @@ fn handle_request(
                 .map(|state| state.snapshot())
                 .map_err(lock_error)
         }),
-        "setOverlayPosition" => parse::<OverlayPositionParams>(request.params).and_then(|params| {
-            overlay::set_native_overlay_position(params.position);
+        "setPanelPosition" => parse::<PanelPositionParams>(request.params).and_then(|params| {
+            overlay::set_native_panel_position(params.position);
+            backend
+                .lock()
+                .map(|state| state.snapshot())
+                .map_err(lock_error)
+        }),
+        "setPanelZoom" => parse::<PanelZoomParams>(request.params).and_then(|params| {
+            overlay::set_native_panel_zoom(params.zoom);
+            backend
+                .lock()
+                .map(|state| state.snapshot())
+                .map_err(lock_error)
+        }),
+        "setPanelSize" => parse::<PanelSizeParams>(request.params).and_then(|params| {
+            overlay::set_native_panel_size(params.size);
+            backend
+                .lock()
+                .map(|state| state.snapshot())
+                .map_err(lock_error)
+        }),
+        "setVoiceEnabled" => parse::<VoiceEnabledParams>(request.params).and_then(|params| {
+            voice.set_enabled(params.enabled).map_err(voice_error)?;
+            backend
+                .lock()
+                .map(|state| state.snapshot())
+                .map_err(lock_error)
+        }),
+        "setVoiceInputDevice" => {
+            parse::<VoiceInputDeviceParams>(request.params).and_then(|params| {
+                voice
+                    .set_input_device(params.device_id)
+                    .map_err(voice_error)?;
+                backend
+                    .lock()
+                    .map(|state| state.snapshot())
+                    .map_err(lock_error)
+            })
+        }
+        "setVoiceInteractionMode" => {
+            parse::<VoiceInteractionModeParams>(request.params).and_then(|params| {
+                voice
+                    .set_interaction_mode(params.mode)
+                    .map_err(voice_error)?;
+                backend
+                    .lock()
+                    .map(|state| state.snapshot())
+                    .map_err(lock_error)
+            })
+        }
+        "setVoiceSubmissionMode" => {
+            parse::<VoiceSubmissionModeParams>(request.params).and_then(|params| {
+                voice
+                    .set_submission_mode(params.mode)
+                    .map_err(voice_error)?;
+                backend
+                    .lock()
+                    .map(|state| state.snapshot())
+                    .map_err(lock_error)
+            })
+        }
+        "refreshVoiceDevices" => voice.refresh_devices().map_err(voice_error).and_then(|()| {
+            backend
+                .lock()
+                .map(|state| state.snapshot())
+                .map_err(lock_error)
+        }),
+        "retryVoiceSetup" => voice.retry_setup().map_err(voice_error).and_then(|()| {
+            backend
+                .lock()
+                .map(|state| state.snapshot())
+                .map_err(lock_error)
+        }),
+        "setVoiceModel" => parse::<VoiceModelParams>(request.params).and_then(|params| {
+            voice.set_model(params.model_id).map_err(voice_error)?;
+            backend
+                .lock()
+                .map(|state| state.snapshot())
+                .map_err(lock_error)
+        }),
+        "downloadVoiceModel" => parse::<VoiceModelParams>(request.params).and_then(|params| {
+            voice.download_model(params.model_id).map_err(voice_error)?;
+            backend
+                .lock()
+                .map(|state| state.snapshot())
+                .map_err(lock_error)
+        }),
+        "cancelVoiceModelDownload" => {
+            parse::<VoiceModelParams>(request.params).and_then(|params| {
+                voice
+                    .cancel_model_download(params.model_id)
+                    .map_err(voice_error)?;
+                backend
+                    .lock()
+                    .map(|state| state.snapshot())
+                    .map_err(lock_error)
+            })
+        }
+        "removeVoiceModel" => parse::<VoiceModelParams>(request.params).and_then(|params| {
+            voice.remove_model(params.model_id).map_err(voice_error)?;
+            backend
+                .lock()
+                .map(|state| state.snapshot())
+                .map_err(lock_error)
+        }),
+        "startVoiceTest" => voice.start_test().map_err(voice_error).and_then(|()| {
+            backend
+                .lock()
+                .map(|state| state.snapshot())
+                .map_err(lock_error)
+        }),
+        "stopVoiceTest" => voice.stop_test().map_err(voice_error).and_then(|()| {
             backend
                 .lock()
                 .map(|state| state.snapshot())
@@ -293,14 +488,16 @@ fn handle_request(
     match result {
         Ok(snapshot) => {
             write_message(output, &IpcResponse::success(id, snapshot.clone()));
-            write_message(
-                output,
-                &IpcEvent {
-                    protocol_version: PROTOCOL_VERSION,
-                    event: "snapshotChanged",
-                    payload: snapshot,
-                },
-            );
+            if publish_response_snapshot {
+                write_message(
+                    output,
+                    &IpcEvent {
+                        protocol_version: PROTOCOL_VERSION,
+                        event: "snapshotChanged",
+                        payload: snapshot,
+                    },
+                );
+            }
         }
         Err(error) => write_message(output, &IpcResponse::<Value>::failure(id, error)),
     }
@@ -311,6 +508,40 @@ fn codex_error(_: chathead_core::CodexServiceError) -> IpcError {
         code: ErrorCode::ChatUnavailable,
         message: "experimental Codex service is unavailable".to_owned(),
         recoverable: true,
+    }
+}
+
+fn voice_error(error: chathead_voice::VoiceServiceError) -> IpcError {
+    IpcError {
+        code: ErrorCode::VoiceUnavailable,
+        message: error.to_string(),
+        recoverable: true,
+    }
+}
+
+fn handle_voice_event(
+    app: &gtk::Application,
+    backend: &Arc<Mutex<Backend>>,
+    output: &Output,
+    event: VoiceEvent,
+) {
+    if let VoiceEvent::Snapshot(snapshot) = &event
+        && let Ok(mut state) = backend.lock()
+    {
+        state.set_voice_snapshot(snapshot.clone());
+        write_snapshot_changed(output, state.snapshot());
+    }
+    if let VoiceEvent::LevelChanged { level } = event {
+        write_message(
+            output,
+            &IpcEvent {
+                protocol_version: PROTOCOL_VERSION,
+                event: "voiceLevelChanged",
+                payload: json!({ "level": level }),
+            },
+        );
+    } else {
+        overlay::handle_voice_event(app, &event);
     }
 }
 
@@ -375,6 +606,24 @@ fn parse<T: for<'de> Deserialize<'de>>(value: Value) -> Result<T, IpcError> {
     })
 }
 
+fn publishes_response_snapshot(method: &str) -> bool {
+    !matches!(
+        method,
+        "setVoiceEnabled"
+            | "setVoiceInputDevice"
+            | "setVoiceInteractionMode"
+            | "setVoiceSubmissionMode"
+            | "refreshVoiceDevices"
+            | "retryVoiceSetup"
+            | "setVoiceModel"
+            | "downloadVoiceModel"
+            | "cancelVoiceModelDownload"
+            | "removeVoiceModel"
+            | "startVoiceTest"
+            | "stopVoiceTest"
+    )
+}
+
 fn lock_error<T>(_: std::sync::PoisonError<T>) -> IpcError {
     IpcError {
         code: ErrorCode::SidecarUnavailable,
@@ -426,5 +675,31 @@ mod tests {
     fn request_protocol_version_is_mandatory() {
         let request = serde_json::from_str::<IpcRequest>(r#"{"id":"1","method":"getSnapshot"}"#);
         assert!(request.is_err());
+    }
+
+    #[test]
+    fn asynchronous_voice_commands_do_not_publish_stale_response_snapshots() {
+        assert!(!publishes_response_snapshot("setVoiceEnabled"));
+        assert!(!publishes_response_snapshot("startVoiceTest"));
+        assert!(publishes_response_snapshot("getSnapshot"));
+    }
+
+    #[test]
+    fn panel_zoom_parameters_reject_values_outside_the_protocol_levels() {
+        assert!(parse::<PanelZoomParams>(json!({ "zoom": 125 })).is_ok());
+        assert!(parse::<PanelZoomParams>(json!({ "zoom": 95 })).is_err());
+    }
+
+    #[test]
+    fn panel_size_parameters_reject_values_outside_the_protocol_bounds() {
+        assert!(
+            parse::<PanelSizeParams>(json!({ "size": { "width": 720, "height": 600 } })).is_ok()
+        );
+        assert!(
+            parse::<PanelSizeParams>(json!({ "size": { "width": 419, "height": 600 } })).is_err()
+        );
+        assert!(
+            parse::<PanelSizeParams>(json!({ "size": { "width": 720, "height": 801 } })).is_err()
+        );
     }
 }
