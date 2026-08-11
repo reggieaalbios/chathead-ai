@@ -48,6 +48,19 @@ impl Conversation {
         self.last_prompt.as_deref()
     }
 
+    #[must_use]
+    pub fn prompt_for_assistant(&self, assistant_message_id: &str) -> Option<&str> {
+        let assistant_index = self
+            .messages
+            .iter()
+            .position(|message| message.id == assistant_message_id)?;
+        self.messages[..assistant_index]
+            .iter()
+            .rev()
+            .find(|message| message.role == MessageRole::User)
+            .map(|message| message.text.as_str())
+    }
+
     pub fn send(&mut self, text: &str) -> Result<String, CodexServiceError> {
         let text = text.trim();
         if text.is_empty() {
@@ -67,6 +80,7 @@ impl Conversation {
             state: MessageState::Complete,
         });
         self.active_message_id = Some(id.clone());
+        self.ensure_assistant(&id);
         Ok(id)
     }
 
@@ -124,7 +138,11 @@ impl Conversation {
             return;
         }
         let index = self.ensure_assistant(message_id);
-        self.messages[index].state = state;
+        if state == MessageState::Interrupted && self.messages[index].text.is_empty() {
+            self.messages.remove(index);
+        } else {
+            self.messages[index].state = state;
+        }
         self.active_message_id = None;
     }
 }
@@ -137,6 +155,12 @@ mod tests {
     fn send_stream_and_complete_one_message() {
         let mut conversation = Conversation::default();
         let id = conversation.send("Hello").expect("send");
+
+        assert_eq!(conversation.messages().len(), 2);
+        assert_eq!(conversation.messages()[1].role, MessageRole::Assistant);
+        assert_eq!(conversation.messages()[1].state, MessageState::Streaming);
+        assert!(conversation.messages()[1].text.is_empty());
+
         conversation.apply(&CodexEvent::AssistantTextDelta {
             message_id: id.clone(),
             delta: "Hi ".to_owned(),
@@ -170,5 +194,57 @@ mod tests {
             delta: "late".to_owned(),
         });
         assert!(conversation.messages().is_empty());
+    }
+
+    #[test]
+    fn interrupt_removes_an_empty_assistant_placeholder() {
+        let mut conversation = Conversation::default();
+        let id = conversation.send("Hello").expect("send");
+
+        conversation.apply(&CodexEvent::TurnInterrupted { message_id: id });
+
+        assert_eq!(conversation.messages().len(), 1);
+        assert_eq!(conversation.messages()[0].role, MessageRole::User);
+        assert!(!conversation.is_busy());
+    }
+
+    #[test]
+    fn interrupt_keeps_partial_assistant_text() {
+        let mut conversation = Conversation::default();
+        let id = conversation.send("Hello").expect("send");
+        conversation.apply(&CodexEvent::AssistantTextDelta {
+            message_id: id.clone(),
+            delta: "Partial response".to_owned(),
+        });
+
+        conversation.apply(&CodexEvent::TurnInterrupted { message_id: id });
+
+        assert_eq!(conversation.messages().len(), 2);
+        assert_eq!(conversation.messages()[1].text, "Partial response");
+        assert_eq!(conversation.messages()[1].state, MessageState::Interrupted);
+        assert!(!conversation.is_busy());
+    }
+
+    #[test]
+    fn resolves_the_prompt_for_each_assistant_response() {
+        let mut conversation = Conversation::default();
+        let first_id = conversation.send("first prompt").expect("first send");
+        conversation.apply(&CodexEvent::TurnCompleted {
+            message_id: first_id,
+        });
+        let second_id = conversation.send("second prompt").expect("second send");
+        conversation.apply(&CodexEvent::TurnCompleted {
+            message_id: second_id,
+        });
+
+        assert_eq!(
+            conversation.prompt_for_assistant("assistant-1"),
+            Some("first prompt")
+        );
+        assert_eq!(
+            conversation.prompt_for_assistant("assistant-2"),
+            Some("second prompt")
+        );
+        assert_eq!(conversation.prompt_for_assistant("missing"), None);
     }
 }

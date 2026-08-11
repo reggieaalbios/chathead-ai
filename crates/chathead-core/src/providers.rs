@@ -3,7 +3,7 @@ use std::{collections::HashMap, env};
 use crate::{
     AuthMethod, AuthenticationState, BackendSnapshot, ErrorCode, ExperimentalChatSnapshot,
     ExperimentalChatState, IpcError, LaunchReadiness, ProviderId, ProviderKind, ProviderSnapshot,
-    ProviderStatus, ShortcutStatus, VoiceState,
+    ProviderStatus, ShortcutStatus, VoiceSnapshot,
 };
 
 const KEYRING_SERVICE: &str = "io.github.chathead_ai.ChatHead";
@@ -95,8 +95,9 @@ impl From<BackendError> for IpcError {
 pub struct Backend {
     statuses: HashMap<ProviderId, ProviderStatus>,
     overlay_running: bool,
-    voice_state: VoiceState,
+    voice: VoiceSnapshot,
     shortcut_status: ShortcutStatus,
+    panel_shortcut_status: ShortcutStatus,
     experimental_chat: ExperimentalChatSnapshot,
 }
 
@@ -127,8 +128,9 @@ impl Backend {
         Self {
             statuses,
             overlay_running: false,
-            voice_state: VoiceState::Idle,
+            voice: VoiceSnapshot::default(),
             shortcut_status: ShortcutStatus::Registering,
+            panel_shortcut_status: ShortcutStatus::Registering,
             experimental_chat: ExperimentalChatSnapshot {
                 provider_id: ProviderId::ChatGpt,
                 experimental: true,
@@ -160,10 +162,19 @@ impl Backend {
             providers,
             launch_readiness: self.launch_readiness(),
             overlay_running: self.overlay_running,
-            voice_state: self.voice_state,
+            voice: self.voice.clone(),
             shortcut_status: self.shortcut_status.clone(),
+            panel_shortcut_status: self.panel_shortcut_status.clone(),
             experimental_chat: self.experimental_chat.clone(),
         }
+    }
+
+    pub fn set_shortcut_status(&mut self, shortcut_status: ShortcutStatus) {
+        self.shortcut_status = shortcut_status;
+    }
+
+    pub fn set_panel_shortcut_status(&mut self, shortcut_status: ShortcutStatus) {
+        self.panel_shortcut_status = shortcut_status;
     }
 
     pub fn save_api_key(
@@ -246,6 +257,10 @@ impl Backend {
 
     pub fn set_overlay_running(&mut self, running: bool) {
         self.overlay_running = running;
+    }
+
+    pub fn set_voice_snapshot(&mut self, voice: VoiceSnapshot) {
+        self.voice = voice;
     }
 
     pub fn set_codex_availability(&mut self, available: bool, message: Option<String>) {
@@ -388,8 +403,9 @@ mod tests {
         let mut backend = Backend {
             statuses: HashMap::new(),
             overlay_running: false,
-            voice_state: VoiceState::Idle,
+            voice: VoiceSnapshot::default(),
             shortcut_status: ShortcutStatus::Registering,
+            panel_shortcut_status: ShortcutStatus::Registering,
             experimental_chat: ExperimentalChatSnapshot {
                 provider_id: ProviderId::ChatGpt,
                 experimental: true,
@@ -414,8 +430,9 @@ mod tests {
         let mut backend = Backend {
             statuses: HashMap::new(),
             overlay_running: false,
-            voice_state: VoiceState::Idle,
+            voice: VoiceSnapshot::default(),
             shortcut_status: ShortcutStatus::Registering,
+            panel_shortcut_status: ShortcutStatus::Registering,
             experimental_chat: ExperimentalChatSnapshot {
                 provider_id: ProviderId::ChatGpt,
                 experimental: true,
@@ -430,5 +447,30 @@ mod tests {
             },
         );
         assert_eq!(backend.launch_readiness(), LaunchReadiness::Ready);
+    }
+
+    #[test]
+    fn global_shortcut_statuses_are_tracked_independently() {
+        let mut backend = Backend::new();
+        backend.set_shortcut_status(ShortcutStatus::Ready {
+            trigger: "Super+E".to_owned(),
+        });
+        backend.set_panel_shortcut_status(ShortcutStatus::ConflictPossible {
+            details: "Super+W is reserved".to_owned(),
+        });
+
+        let snapshot = backend.snapshot();
+        assert_eq!(
+            snapshot.shortcut_status,
+            ShortcutStatus::Ready {
+                trigger: "Super+E".to_owned(),
+            }
+        );
+        assert_eq!(
+            snapshot.panel_shortcut_status,
+            ShortcutStatus::ConflictPossible {
+                details: "Super+W is reserved".to_owned(),
+            }
+        );
     }
 }

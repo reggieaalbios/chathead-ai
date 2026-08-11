@@ -12,7 +12,11 @@ pub use conversation::{ChatMessage, Conversation, MessageRole, MessageState};
 
 pub use protocol::{
     AuthMethod, BackendSnapshot, ErrorCode, ExperimentalChatSnapshot, ExperimentalChatState,
-    IpcError, IpcEvent, IpcRequest, IpcResponse, LaunchReadiness, PROTOCOL_VERSION, ProviderId,
-    ProviderKind, ProviderSnapshot, ProviderStatus, ShortcutStatus, VoiceState,
+    IpcError, IpcEvent, IpcRequest, IpcResponse, LaunchReadiness, MicrophoneAccess,
+    PANEL_HEIGHT_DEFAULT, PANEL_HEIGHT_MAX, PANEL_HEIGHT_MIN, PANEL_WIDTH_DEFAULT, PANEL_WIDTH_MAX,
+    PANEL_WIDTH_MIN, PANEL_ZOOM_LEVELS, PROTOCOL_VERSION, PanelSize, PanelZoom, ProviderId,
+    ProviderKind, ProviderSnapshot, ProviderStatus, ShortcutStatus, VoiceInputDevice,
+    VoiceInteractionMode, VoiceModelId, VoiceModelSnapshot, VoiceModelState, VoicePhase,
+    VoiceSnapshot, VoiceSubmissionMode,
 };
 pub use providers::{Backend, BackendError};
