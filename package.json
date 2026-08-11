@@ -20,7 +20,10 @@
     "test": "vitest run",
     "check": "pnpm typecheck && pnpm lint && pnpm test && cargo fmt --all --check && ./scripts/cargo-native.sh clippy --workspace --all-targets -- -D warnings && ./scripts/cargo-native.sh test --workspace",
     "build": "./scripts/cargo-native.sh build -p chathead-linux --release && electron-vite build",
-    "dist:linux": "pnpm build && electron-builder --linux AppImage deb --x64",
+    "check:sidecar-links": "./scripts/check-sidecar-links.sh target/release/chathead-linux .local-native/lib",
+    "check:packaged-sidecars": "./scripts/check-packaged-sidecars.sh",
+    "benchmark:voice": "./scripts/cargo-native.sh run -p chathead-voice --bin voice-benchmark --",
+    "dist:linux": "pnpm build && pnpm check:sidecar-links && electron-builder --linux AppImage deb --x64 && pnpm check:packaged-sidecars",
     "install:local": "./scripts/install-local.sh"
   },
   "dependencies": {
@@ -68,6 +71,9 @@
       "icon": "src/assets/provider/light/image-Photoroom (1).png",
       "syncDesktopName": true,
       "artifactName": "${productName}-${version}-${arch}.${ext}"
+    },
+    "deb": {
+      "depends": ["libasound2t64 | libasound2", "libpipewire-0.3-0"]
     }
   }
 }
