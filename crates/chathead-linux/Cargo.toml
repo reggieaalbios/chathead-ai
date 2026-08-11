@@ -13,12 +13,16 @@ path = "src/main.rs"
 [dependencies]
 ashpd.workspace = true
 chathead-core = { path = "../chathead-core" }
+chathead-voice = { path = "../chathead-voice" }
 futures-util.workspace = true
 gtk.workspace = true
 gtk4-layer-shell.workspace = true
+pulldown-cmark.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+syntect.workspace = true
 tokio.workspace = true
+url.workspace = true
 
 [lints]
 workspace = true
