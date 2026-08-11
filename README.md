@@ -39,7 +39,7 @@ update command again.
 
 ## Development
 
-Install the local layer-shell dependency when the system does not provide it:
+Install the local layer-shell dependency when the system does not provide it and fetch the pinned, checksum-verified sherpa-onnx native archive:
 
 ```sh
 pnpm bootstrap
@@ -69,7 +69,10 @@ pnpm dist:linux
 
 The first command builds the release sidecar and production Electron bundles.
 The second creates x86_64 AppImage and Debian artifacts. The package includes
-the Rust sidecar and the locally bootstrapped `gtk4-layer-shell` runtime.
+the Rust sidecar and the locally bootstrapped `gtk4-layer-shell` runtime. Debian
+declares ALSA and PipeWire runtime dependencies; CPAL's PulseAudio backend uses
+the server protocol directly, so it does not add a `libpulse` link; packaging also
+runs `ldd` against the release sidecar.
 
 For a repository-backed local launcher:
 
@@ -80,7 +83,7 @@ chathead-ai
 
 ## Security and IPC
 
-The sidecar speaks newline-delimited JSON protocol version 2 over stdin/stdout.
+The sidecar speaks newline-delimited JSON protocol version 9 over stdin/stdout.
 Stdout is reserved for protocol messages; diagnostics use stderr. Snapshots
 contain provider status and overlay state but never credential values.
 
@@ -115,5 +118,33 @@ clears the conversation.
 The overlay remains a monitor-sized GTK layer surface. Its compositor input
 region contains only the orb and open panel at rest, expands for dragging, and
 returns to click-through behavior after release. The panel is kept within the
-output edges. `Super+Shift+V` toggles the current visual listening state through
-the XDG GlobalShortcuts portal; microphone capture is not part of this release.
+output edges.
+
+Local Voice is off by default. Settings offers independently downloadable,
+checksum-verified Whisper Tiny multilingual INT8 and Qwen3-ASR 0.6B INT8
+models. Whisper remains the fresh-install selection until the documented
+English/Filipino/code-switching accuracy and hardware performance gates have
+been completed; Qwen can already be downloaded and activated explicitly.
+Hold `Super+E` to capture and release it to transcribe; Toggle mode
+is available for portals that do not reliably deliver release events. English,
+Filipino/Tagalog, and common code-switching are recognized locally. The final
+transcript enters the existing composer and sends after a fixed 0.7-second Esc
+cancellation window.
+
+Press `Super+W` to toggle the chat panel without changing voice capture or an
+in-progress chat response. The companion orb remains available while the panel
+is hidden.
+
+Capture uses the native Rust sidecar through PipeWire, PulseAudio, or ALSA. Raw
+audio stays in bounded memory, is never saved, is never sent through Electron
+IPC, and is never uploaded. Recording auto-finalizes after 30 seconds.
+No-speech recordings, device loss, overflow, empty transcripts, and busy-chat
+attempts are discarded without sending a prompt.
+
+Private local comparisons use a tab-separated manifest whose rows contain an
+absolute mono-WAV path and reference transcript. Audio remains outside git:
+
+```bash
+pnpm benchmark:voice -- sherpa-onnx-whisper-tiny-int8-multilingual-v1 /absolute/path/manifest.tsv
+pnpm benchmark:voice -- sherpa-onnx-qwen3-asr-0.6b-int8-2026-03-25 /absolute/path/manifest.tsv
+```
