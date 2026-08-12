@@ -11,8 +11,9 @@ pub use codex_app_server::{
 pub use conversation::{ChatMessage, Conversation, MessageRole, MessageState};
 
 pub use protocol::{
-    AuthMethod, BackendSnapshot, ErrorCode, ExperimentalChatSnapshot, ExperimentalChatState,
-    IpcError, IpcEvent, IpcRequest, IpcResponse, LaunchReadiness, MicrophoneAccess,
+    AuthMethod, BackendSnapshot, DesktopIntegrationKind, DesktopIntegrationSnapshot,
+    DesktopIntegrationStatus, ErrorCode, ExperimentalChatSnapshot, ExperimentalChatState, IpcError,
+    IpcEvent, IpcRequest, IpcResponse, LaunchBlocker, LaunchReadiness, MicrophoneAccess,
     PANEL_HEIGHT_DEFAULT, PANEL_HEIGHT_MAX, PANEL_HEIGHT_MIN, PANEL_WIDTH_DEFAULT, PANEL_WIDTH_MAX,
     PANEL_WIDTH_MIN, PANEL_ZOOM_LEVELS, PROTOCOL_VERSION, PanelSize, PanelZoom, ProviderId,
     ProviderKind, ProviderSnapshot, ProviderStatus, ShortcutStatus, VoiceInputDevice,

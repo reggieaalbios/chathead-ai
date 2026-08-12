@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub const PROTOCOL_VERSION: u16 = 10;
+pub const PROTOCOL_VERSION: u16 = 11;
 
 pub const PANEL_ZOOM_LEVELS: [u16; 6] = [80, 90, 100, 110, 125, 150];
 pub const PANEL_WIDTH_MIN: u16 = 420;
@@ -190,9 +190,68 @@ pub enum ProviderStatus {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub enum LaunchReadiness {
-    Ready,
+pub enum LaunchBlocker {
     MissingLaunchProvider,
+    DesktopIntegrationRequired,
+    DesktopIntegrationUnavailable,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LaunchReadiness {
+    pub ready: bool,
+    pub blockers: Vec<LaunchBlocker>,
+}
+
+impl LaunchReadiness {
+    #[must_use]
+    pub fn from_blockers(blockers: Vec<LaunchBlocker>) -> Self {
+        Self {
+            ready: blockers.is_empty(),
+            blockers,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DesktopIntegrationKind {
+    LayerShell,
+    GnomeShell,
+    Unsupported,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DesktopIntegrationStatus {
+    Ready,
+    NotInstalled,
+    Disabled,
+    Incompatible,
+    Unavailable,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopIntegrationSnapshot {
+    pub kind: DesktopIntegrationKind,
+    pub status: DesktopIntegrationStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gnome_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+impl DesktopIntegrationSnapshot {
+    #[must_use]
+    pub fn layer_shell_ready() -> Self {
+        Self {
+            kind: DesktopIntegrationKind::LayerShell,
+            status: DesktopIntegrationStatus::Ready,
+            gnome_version: None,
+            message: None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -364,6 +423,7 @@ pub struct ProviderSnapshot {
 pub struct BackendSnapshot {
     pub providers: Vec<ProviderSnapshot>,
     pub launch_readiness: LaunchReadiness,
+    pub desktop_integration: DesktopIntegrationSnapshot,
     pub overlay_running: bool,
     pub voice: VoiceSnapshot,
     pub shortcut_status: ShortcutStatus,
@@ -388,7 +448,8 @@ pub enum ErrorCode {
     CredentialStoreUnavailable,
     CodexNotFound,
     AuthFailed,
-    LayerShellUnsupported,
+    DesktopIntegrationRequired,
+    DesktopIntegrationUnavailable,
     SidecarUnavailable,
     ProtocolMismatch,
     InvalidRequest,
@@ -470,7 +531,10 @@ mod tests {
             "request-1".to_owned(),
             BackendSnapshot {
                 providers: Vec::new(),
-                launch_readiness: LaunchReadiness::MissingLaunchProvider,
+                launch_readiness: LaunchReadiness::from_blockers(vec![
+                    LaunchBlocker::MissingLaunchProvider,
+                ]),
+                desktop_integration: DesktopIntegrationSnapshot::layer_shell_ready(),
                 overlay_running: false,
                 voice: VoiceSnapshot::default(),
                 shortcut_status: ShortcutStatus::Registering,
@@ -534,7 +598,7 @@ mod tests {
             payload: PanelZoom::try_from(125).expect("valid zoom"),
         };
         let json = serde_json::to_value(event).expect("serialize event");
-        assert_eq!(json["protocolVersion"], 10);
+        assert_eq!(json["protocolVersion"], 11);
         assert_eq!(json["event"], "panelZoomChanged");
         assert_eq!(json["payload"], 125);
     }
@@ -572,7 +636,7 @@ mod tests {
             payload: PanelSize::try_new(720, 600).expect("valid panel size"),
         };
         let json = serde_json::to_value(event).expect("serialize event");
-        assert_eq!(json["protocolVersion"], 10);
+        assert_eq!(json["protocolVersion"], 11);
         assert_eq!(json["event"], "panelSizeChanged");
         assert_eq!(json["payload"]["width"], 720);
         assert_eq!(json["payload"]["height"], 600);

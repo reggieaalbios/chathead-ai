@@ -96,6 +96,7 @@ export class SidecarManager {
   disconnectProvider = (providerId: ProviderId): Promise<BackendSnapshot> => this.request('disconnectProvider', { providerId })
   launchOverlay = (): Promise<BackendSnapshot> => this.request('launchOverlay')
   stopOverlay = (): Promise<BackendSnapshot> => this.request('stopOverlay')
+  refreshDesktopIntegration = (): Promise<BackendSnapshot> => this.request('refreshDesktopIntegration')
   setOverlayTheme = (theme: ResolvedAppearance): Promise<BackendSnapshot> => {
     this.overlayTheme = theme
     return this.request('setOverlayTheme', { theme })

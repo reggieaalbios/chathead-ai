@@ -26,7 +26,7 @@ use chathead_voice::{VoiceEvent, VoiceService};
 use futures_util::StreamExt;
 use gtk::{cairo, gdk, glib, prelude::*};
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::response_view::{
     AssistantDocument, DocumentTheme, HighlightWorker, LinkHandler, RetryHandler,
@@ -48,6 +48,11 @@ const CLICK_THRESHOLD: f64 = 5.0;
 const ACTION_POLL_MS: u64 = 40;
 const ANIMATION_FRAME_MS: u64 = 33;
 const STREAM_RENDER_INTERVAL_MS: u64 = 33;
+const TRANSCRIPT_SCROLL_FRAME_MS: u64 = 16;
+const TRANSCRIPT_FOCUS_SCROLL_FACTOR: f64 = 0.30;
+const TRANSCRIPT_WHEEL_SCROLL_FACTOR: f64 = 0.42;
+const TRANSCRIPT_WHEEL_STEP: f64 = 52.0;
+const TRANSCRIPT_TOP_PADDING: f64 = 8.0;
 const VOICE_SEND_DELAY: Duration = Duration::from_millis(700);
 const WAKE_ANIMATION_SECONDS: f64 = 0.36;
 static ORB_THEME: AtomicU8 = AtomicU8::new(0);
@@ -70,6 +75,7 @@ struct PanelMetrics {
     transcript_spacing: i32,
     composer_height: i32,
     composer_view_height: i32,
+    composer_max_height: i32,
     compact_target: i32,
     send_target: i32,
     title_font: i32,
@@ -88,6 +94,7 @@ impl PanelMetrics {
             transcript_spacing: scaled(18).max(12),
             composer_height: scaled(46).max(36),
             composer_view_height: scaled(42).max(32),
+            composer_max_height: scaled(120).max(96),
             compact_target: scaled(28).max(28),
             send_target: scaled(36).max(28),
             title_font: scaled(14).max(10),
@@ -97,7 +104,7 @@ impl PanelMetrics {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum OrbTheme {
     Light,
@@ -112,7 +119,7 @@ impl OrbTheme {
         }
     }
 
-    fn current() -> Self {
+    pub(crate) fn current() -> Self {
         if ORB_THEME.load(Ordering::Relaxed) == Self::Dark.value() {
             Self::Dark
         } else {
@@ -121,7 +128,7 @@ impl OrbTheme {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum PanelPosition {
     Left,
@@ -143,7 +150,7 @@ impl PanelPosition {
         }
     }
 
-    fn current() -> Self {
+    pub(crate) fn current() -> Self {
         if PANEL_POSITION.load(Ordering::Relaxed) == Self::Right.value() {
             Self::Right
         } else {
@@ -181,6 +188,7 @@ pub(crate) fn set_native_overlay_theme(app: &gtk::Application, theme: OrbTheme) 
             glib::idle_add_local_once(move || anchor.restore(&adjustment));
         }
     });
+    crate::presentation::set_appearance(theme);
 }
 
 impl From<OrbTheme> for DocumentTheme {
@@ -200,9 +208,11 @@ pub(crate) fn set_native_panel_position(position: PanelPosition) {
             apply_panel_position(runtime);
         }
     });
+    crate::presentation::set_position(position);
 }
 
 pub(crate) fn set_native_panel_zoom(zoom: PanelZoom) {
+    crate::presentation::set_zoom(zoom);
     let zoom_value = u8::try_from(zoom.value()).expect("validated panel zoom fits in u8");
     let previous = PANEL_ZOOM.swap(zoom_value, Ordering::Relaxed);
     if previous == zoom_value {
@@ -217,11 +227,12 @@ pub(crate) fn set_native_panel_zoom(zoom: PanelZoom) {
     update_panel_zoom_css(zoom);
 }
 
-fn current_panel_zoom() -> PanelZoom {
+pub(crate) fn current_panel_zoom() -> PanelZoom {
     PanelZoom::try_from(u16::from(PANEL_ZOOM.load(Ordering::Relaxed))).unwrap_or(PanelZoom::DEFAULT)
 }
 
 pub(crate) fn set_native_panel_size(size: PanelSize) {
+    crate::presentation::set_size(size);
     if size == current_panel_size() {
         return;
     }
@@ -249,7 +260,7 @@ pub(crate) fn set_native_panel_size(size: PanelSize) {
     });
 }
 
-fn current_panel_size() -> PanelSize {
+pub(crate) fn current_panel_size() -> PanelSize {
     PanelSize::try_new(
         PANEL_WIDTH.load(Ordering::Relaxed),
         PANEL_HEIGHT.load(Ordering::Relaxed),
@@ -371,12 +382,37 @@ enum VoiceState {
     Listening,
 }
 
-enum AppEvent {
+#[derive(Clone)]
+pub(crate) enum AppEvent {
     CancelVoice,
     VoiceShortcutActivated,
     VoiceShortcutDeactivated,
     TogglePanel,
     ShortcutStatus(ShortcutAction, ShortcutStatus),
+}
+
+impl AppEvent {
+    pub(crate) fn shortcut_status_update(&self) -> Option<ShortcutStatusUpdate> {
+        let Self::ShortcutStatus(action, status) = self else {
+            return None;
+        };
+        let status = match status {
+            ShortcutStatus::Registering => ProtocolShortcutStatus::Registering,
+            ShortcutStatus::Ready(trigger) => ProtocolShortcutStatus::Ready {
+                trigger: trigger.clone(),
+            },
+            ShortcutStatus::ConflictPossible(details) => ProtocolShortcutStatus::ConflictPossible {
+                details: details.clone(),
+            },
+            ShortcutStatus::Unavailable(details) => ProtocolShortcutStatus::Unavailable {
+                details: details.clone(),
+            },
+        };
+        Some(ShortcutStatusUpdate {
+            action: *action,
+            status,
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -391,7 +427,7 @@ pub(crate) struct ShortcutStatusUpdate {
 }
 
 #[derive(Clone)]
-enum ShortcutStatus {
+pub(crate) enum ShortcutStatus {
     Registering,
     Ready(String),
     ConflictPossible(String),
@@ -529,12 +565,25 @@ struct PanelRuntime {
     chat_message: Rc<RefCell<Option<String>>>,
     failure: Rc<RefCell<Option<String>>>,
     rendered_messages: Rc<RefCell<Vec<RenderedMessage>>>,
+    transcript_scroll: Rc<RefCell<TranscriptScrollState>>,
     stream_render_source: Rc<RefCell<Option<glib::SourceId>>>,
     highlight_worker: HighlightWorker,
     pending_link: Rc<RefCell<Option<String>>>,
     voice: VoiceService,
     pending_voice: Rc<RefCell<PendingVoice>>,
     output: super::Output,
+}
+
+#[derive(Default)]
+struct TranscriptScrollState {
+    anchor_message_id: Option<String>,
+    response_message_id: Option<String>,
+    response_focus_blocked: bool,
+    response_focus_requested: bool,
+    layout_source: Option<glib::SourceId>,
+    animation_source: Option<glib::SourceId>,
+    animation_target: Option<f64>,
+    animation_factor: f64,
 }
 
 #[derive(Clone)]
@@ -658,6 +707,7 @@ pub(crate) fn start_native_overlay(
         chat_message: Rc::new(RefCell::new(chat.message)),
         failure: Rc::new(RefCell::new(None)),
         rendered_messages: Rc::new(RefCell::new(Vec::new())),
+        transcript_scroll: Rc::new(RefCell::new(TranscriptScrollState::default())),
         stream_render_source: Rc::new(RefCell::new(None)),
         highlight_worker: HighlightWorker::start(),
         pending_link: Rc::new(RefCell::new(None)),
@@ -669,6 +719,7 @@ pub(crate) fn start_native_overlay(
     apply_panel_dimensions(&panel_runtime, current_panel_size());
     wire_chat_controls(&panel_runtime);
     attach_panel_zoom_controllers(&panel_runtime);
+    attach_transcript_scroll_controllers(&panel_runtime);
     render_chat(&panel_runtime);
     PANEL_RUNTIME.with(|stored| stored.replace(Some(panel_runtime.clone())));
     start_highlight_result_pump();
@@ -737,7 +788,6 @@ pub(crate) fn start_native_overlay(
         &state,
         shortcut_status_sender,
     );
-    start_shortcut_service(event_sender);
     handle_voice_event(app, &VoiceEvent::Snapshot(voice.snapshot()));
     Ok(())
 }
@@ -844,6 +894,8 @@ fn build_panel(output: &super::Output) -> PanelWidgets {
         .hexpand(true)
         .vexpand(true)
         .hscrollbar_policy(gtk::PolicyType::Never)
+        .overlay_scrolling(false)
+        .kinetic_scrolling(true)
         .css_classes(["transcript-scroll"])
         .build();
     transcript_scroll.set_child(Some(&transcript));
@@ -908,12 +960,13 @@ fn build_panel(output: &super::Output) -> PanelWidgets {
         .wrap_mode(gtk::WrapMode::WordChar)
         .accepts_tab(false)
         .hexpand(true)
-        .height_request(42)
         .css_classes(["prompt-input"])
         .build();
     let composer_scroll = gtk::ScrolledWindow::builder()
         .hexpand(true)
-        .height_request(46)
+        .min_content_height(42)
+        .max_content_height(120)
+        .propagate_natural_height(true)
         .hscrollbar_policy(gtk::PolicyType::Never)
         .vscrollbar_policy(gtk::PolicyType::Automatic)
         .css_classes(["prompt-frame"])
@@ -935,7 +988,7 @@ fn build_panel(output: &super::Output) -> PanelWidgets {
     let send = gtk::Button::builder()
         .label("↑")
         .tooltip_text("Send message")
-        .valign(gtk::Align::Center)
+        .valign(gtk::Align::End)
         .sensitive(false)
         .css_classes(["send-button"])
         .build();
@@ -957,6 +1010,7 @@ fn build_panel(output: &super::Output) -> PanelWidgets {
                 runtime.failure.replace(None);
                 runtime.pending_link.replace(None);
                 runtime.widgets.link_confirmation.set_visible(false);
+                reset_transcript_scroll(runtime);
                 let _ = runtime.codex.send(CodexCommand::NewChat);
                 render_chat(runtime);
             }
@@ -990,6 +1044,7 @@ fn build_panel(output: &super::Output) -> PanelWidgets {
 enum TranscriptAnchor {
     Bottom,
     Normalized(f64),
+    Offset(f64),
 }
 
 impl TranscriptAnchor {
@@ -1008,6 +1063,7 @@ impl TranscriptAnchor {
         adjustment.set_value(match self {
             Self::Bottom => range,
             Self::Normalized(position) => range * position,
+            Self::Offset(offset) => offset.clamp(0.0, range),
         });
     }
 }
@@ -1029,11 +1085,11 @@ fn apply_panel_metrics(runtime: &PanelRuntime, zoom: PanelZoom) {
     runtime
         .widgets
         .composer_scroll
-        .set_height_request(metrics.composer_height);
+        .set_min_content_height(metrics.composer_view_height);
     runtime
         .widgets
-        .composer
-        .set_height_request(metrics.composer_view_height);
+        .composer_scroll
+        .set_max_content_height(metrics.composer_max_height);
     runtime.widgets.container.set_size_request(
         i32::from(current_panel_size().width()),
         i32::from(current_panel_size().height()),
@@ -1161,6 +1217,228 @@ fn attach_panel_zoom_controllers(runtime: &PanelRuntime) {
     runtime.widgets.container.add_controller(key);
 }
 
+fn attach_transcript_scroll_controllers(runtime: &PanelRuntime) {
+    let interaction = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
+    interaction.set_propagation_phase(gtk::PropagationPhase::Capture);
+    let runtime_for_interaction = runtime.clone();
+    interaction.connect_scroll_begin(move |_| {
+        interrupt_transcript_auto_scroll(&runtime_for_interaction);
+    });
+    runtime
+        .widgets
+        .transcript_scroll
+        .add_controller(interaction);
+
+    let wheel = gtk::EventControllerScroll::new(
+        gtk::EventControllerScrollFlags::VERTICAL | gtk::EventControllerScrollFlags::DISCRETE,
+    );
+    wheel.set_propagation_phase(gtk::PropagationPhase::Capture);
+    let runtime_for_wheel = runtime.clone();
+    wheel.connect_scroll(move |controller, _, dy| {
+        if controller
+            .current_event_state()
+            .contains(gdk::ModifierType::CONTROL_MASK)
+        {
+            return glib::Propagation::Proceed;
+        }
+        if dy != 0.0 {
+            smoothly_scroll_transcript_by(&runtime_for_wheel, dy * TRANSCRIPT_WHEEL_STEP);
+        }
+        glib::Propagation::Stop
+    });
+    runtime.widgets.transcript_scroll.add_controller(wheel);
+
+    let scrollbar_press = gtk::GestureClick::new();
+    let runtime_for_scrollbar = runtime.clone();
+    scrollbar_press.connect_pressed(move |_, _, _, _| {
+        interrupt_transcript_auto_scroll(&runtime_for_scrollbar);
+    });
+    runtime
+        .widgets
+        .transcript_scroll
+        .vscrollbar()
+        .add_controller(scrollbar_press);
+}
+
+fn begin_transcript_turn(runtime: &PanelRuntime, message_id: &str) {
+    let (layout_source, animation_source) = {
+        let mut scroll = runtime.transcript_scroll.borrow_mut();
+        let sources = (scroll.layout_source.take(), scroll.animation_source.take());
+        scroll.animation_target = None;
+        scroll.anchor_message_id = Some(format!("user-{message_id}"));
+        scroll.response_message_id = Some(format!("assistant-{message_id}"));
+        scroll.response_focus_blocked = false;
+        scroll.response_focus_requested = false;
+        sources
+    };
+    remove_source(layout_source);
+    remove_source(animation_source);
+}
+
+fn request_transcript_response_focus(runtime: &PanelRuntime, message_id: &str) {
+    let assistant_id = format!("assistant-{message_id}");
+    let should_focus = {
+        let mut scroll = runtime.transcript_scroll.borrow_mut();
+        if scroll.response_message_id.as_deref() != Some(assistant_id.as_str())
+            || scroll.response_focus_blocked
+            || scroll.response_focus_requested
+        {
+            false
+        } else {
+            scroll.anchor_message_id = Some(assistant_id);
+            scroll.response_focus_requested = true;
+            true
+        }
+    };
+    if should_focus {
+        queue_transcript_anchor(runtime);
+    }
+}
+
+fn interrupt_transcript_auto_scroll(runtime: &PanelRuntime) {
+    let (layout_source, animation_source) = {
+        let mut scroll = runtime.transcript_scroll.borrow_mut();
+        let sources = (scroll.layout_source.take(), scroll.animation_source.take());
+        scroll.animation_target = None;
+        scroll.anchor_message_id = None;
+        scroll.response_focus_blocked = true;
+        sources
+    };
+    remove_source(layout_source);
+    remove_source(animation_source);
+}
+
+fn reset_transcript_scroll(runtime: &PanelRuntime) {
+    let (layout_source, animation_source) = {
+        let mut scroll = runtime.transcript_scroll.borrow_mut();
+        let sources = (scroll.layout_source.take(), scroll.animation_source.take());
+        *scroll = TranscriptScrollState::default();
+        sources
+    };
+    remove_source(layout_source);
+    remove_source(animation_source);
+}
+
+fn smoothly_scroll_transcript_by(runtime: &PanelRuntime, delta: f64) {
+    let adjustment = runtime.widgets.transcript_scroll.vadjustment();
+    let (layout_source, animation_source, base) = {
+        let mut scroll = runtime.transcript_scroll.borrow_mut();
+        let base = scroll
+            .animation_target
+            .unwrap_or_else(|| adjustment.value());
+        let sources = (scroll.layout_source.take(), scroll.animation_source.take());
+        scroll.animation_target = None;
+        scroll.anchor_message_id = None;
+        scroll.response_focus_blocked = true;
+        (sources.0, sources.1, base)
+    };
+    remove_source(layout_source);
+    remove_source(animation_source);
+    animate_transcript_to(runtime, base + delta, TRANSCRIPT_WHEEL_SCROLL_FACTOR);
+}
+
+fn queue_transcript_anchor(runtime: &PanelRuntime) {
+    let has_anchor = {
+        let scroll = runtime.transcript_scroll.borrow();
+        scroll.anchor_message_id.is_some() && scroll.layout_source.is_none()
+    };
+    if !has_anchor {
+        return;
+    }
+
+    let runtime_for_layout = runtime.clone();
+    let source = glib::timeout_add_local_once(
+        Duration::from_millis(TRANSCRIPT_SCROLL_FRAME_MS),
+        move || {
+            runtime_for_layout
+                .transcript_scroll
+                .borrow_mut()
+                .layout_source = None;
+            let anchor_id = runtime_for_layout
+                .transcript_scroll
+                .borrow()
+                .anchor_message_id
+                .clone();
+            let Some(anchor_id) = anchor_id else {
+                return;
+            };
+            let row = runtime_for_layout
+                .rendered_messages
+                .borrow()
+                .iter()
+                .find(|message| message.id == anchor_id)
+                .map(|message| message.row.clone());
+            let Some(row) = row else {
+                return;
+            };
+            let Some(point) = row.compute_point(
+                &runtime_for_layout.widgets.transcript,
+                &gtk::graphene::Point::new(0.0, 0.0),
+            ) else {
+                return;
+            };
+            animate_transcript_to(
+                &runtime_for_layout,
+                f64::from(point.y()) - TRANSCRIPT_TOP_PADDING,
+                TRANSCRIPT_FOCUS_SCROLL_FACTOR,
+            );
+        },
+    );
+    runtime.transcript_scroll.borrow_mut().layout_source = Some(source);
+}
+
+fn animate_transcript_to(runtime: &PanelRuntime, target: f64, factor: f64) {
+    let adjustment = runtime.widgets.transcript_scroll.vadjustment();
+    let range = (adjustment.upper() - adjustment.page_size()).max(0.0);
+    let target = target.clamp(0.0, range);
+    {
+        let mut scroll = runtime.transcript_scroll.borrow_mut();
+        scroll.animation_target = Some(target);
+        scroll.animation_factor = factor;
+        if scroll.animation_source.is_some() {
+            return;
+        }
+    }
+
+    let scroll_state = runtime.transcript_scroll.clone();
+    let source = glib::timeout_add_local(
+        Duration::from_millis(TRANSCRIPT_SCROLL_FRAME_MS),
+        move || {
+            let (target, factor) = {
+                let scroll = scroll_state.borrow();
+                let Some(target) = scroll.animation_target else {
+                    return glib::ControlFlow::Break;
+                };
+                (target, scroll.animation_factor)
+            };
+            let range = (adjustment.upper() - adjustment.page_size()).max(0.0);
+            let target = target.clamp(0.0, range);
+            let current = adjustment.value();
+            if (target - current).abs() <= 0.5 {
+                adjustment.set_value(target);
+                let mut scroll = scroll_state.borrow_mut();
+                scroll.animation_source = None;
+                scroll.animation_target = None;
+                glib::ControlFlow::Break
+            } else {
+                adjustment.set_value(transcript_scroll_step(current, target, factor));
+                glib::ControlFlow::Continue
+            }
+        },
+    );
+    runtime.transcript_scroll.borrow_mut().animation_source = Some(source);
+}
+
+fn transcript_scroll_step(current: f64, target: f64, factor: f64) -> f64 {
+    current + (target - current) * factor.clamp(0.0, 1.0)
+}
+
+fn remove_source(source: Option<glib::SourceId>) {
+    if let Some(source) = source {
+        source.remove();
+    }
+}
+
 fn wire_chat_controls(runtime: &PanelRuntime) {
     let runtime_for_send = runtime.clone();
     runtime.widgets.send.connect_clicked(move |_| {
@@ -1281,6 +1559,7 @@ fn submit_text(runtime: &PanelRuntime, text: &str) {
             return;
         }
     };
+    begin_transcript_turn(runtime, &message_id);
     runtime.failure.replace(None);
     if runtime
         .codex
@@ -1333,6 +1612,9 @@ pub(crate) fn handle_codex_event(_app: &gtk::Application, event: &CodexEvent) {
             }
             _ => runtime.conversation.borrow_mut().apply(event),
         }
+        if let CodexEvent::AssistantTextDelta { message_id, .. } = event {
+            request_transcript_response_focus(runtime, message_id);
+        }
         if matches!(event, CodexEvent::AssistantTextDelta { .. }) {
             schedule_stream_render(runtime);
         } else {
@@ -1377,7 +1659,8 @@ fn start_highlight_result_pump() {
             if results.is_empty() {
                 return;
             }
-            let anchor = TranscriptAnchor::capture(&runtime.widgets.transcript_scroll);
+            let adjustment = runtime.widgets.transcript_scroll.vadjustment();
+            let anchor = TranscriptAnchor::Offset(adjustment.value());
             let rendered = runtime.rendered_messages.borrow();
             let mut applied = false;
             for result in &results {
@@ -1404,9 +1687,6 @@ fn start_highlight_result_pump() {
 }
 
 fn render_chat(runtime: &PanelRuntime) {
-    let adjustment = runtime.widgets.transcript_scroll.vadjustment();
-    let near_bottom = adjustment.value() + adjustment.page_size() >= adjustment.upper() - 28.0;
-
     let conversation = runtime.conversation.borrow();
     sync_transcript(runtime, conversation.messages());
 
@@ -1433,7 +1713,7 @@ fn render_chat(runtime: &PanelRuntime) {
         "Send message"
     }));
     runtime.widgets.composer.set_sensitive(ready);
-    runtime.widgets.composer.set_editable(ready && !busy);
+    runtime.widgets.composer.set_editable(ready);
     let composer_buffer = runtime.widgets.composer.buffer();
     let composer_text = composer_buffer.text(
         &composer_buffer.start_iter(),
@@ -1443,7 +1723,7 @@ fn render_chat(runtime: &PanelRuntime) {
     runtime
         .widgets
         .composer_placeholder
-        .set_visible(ready && !busy && composer_text.is_empty());
+        .set_visible(ready && composer_text.is_empty());
     runtime
         .widgets
         .send
@@ -1474,13 +1754,7 @@ fn render_chat(runtime: &PanelRuntime) {
         failure.is_some() && conversation.last_prompt().is_some() && !conversation.is_busy(),
     );
     drop(conversation);
-
-    if near_bottom {
-        let adjustment = adjustment.clone();
-        glib::idle_add_local_once(move || {
-            adjustment.set_value((adjustment.upper() - adjustment.page_size()).max(0.0));
-        });
-    }
+    queue_transcript_anchor(runtime);
 }
 
 fn sync_transcript(runtime: &PanelRuntime, messages: &[ChatMessage]) {
@@ -1809,6 +2083,32 @@ fn handle_app_event(
                 update_shortcut_message(message, state);
             }
         }
+    }
+}
+
+pub(crate) fn handle_global_app_event(event: &AppEvent) {
+    match event {
+        AppEvent::CancelVoice => cancel_voice(),
+        AppEvent::VoiceShortcutActivated => {
+            reveal_panel();
+            PANEL_RUNTIME.with(|stored| {
+                if let Some(runtime) = stored.borrow().as_ref() {
+                    let _ = runtime.voice.shortcut_activated(
+                        runtime.conversation.borrow().is_busy(),
+                        runtime.chat_state.get() == ExperimentalChatState::Ready,
+                    );
+                }
+            });
+        }
+        AppEvent::VoiceShortcutDeactivated => {
+            PANEL_RUNTIME.with(|stored| {
+                if let Some(runtime) = stored.borrow().as_ref() {
+                    let _ = runtime.voice.shortcut_deactivated();
+                }
+            });
+        }
+        AppEvent::TogglePanel => toggle_panel(),
+        AppEvent::ShortcutStatus(_, _) => {}
     }
 }
 
@@ -2519,7 +2819,7 @@ fn focus_composer_when_mapped(composer: &gtk::TextView) {
     });
 }
 
-fn start_shortcut_service(sender: mpsc::Sender<AppEvent>) {
+pub(crate) fn start_shortcut_service(sender: mpsc::Sender<AppEvent>) {
     if let Err(error) = thread::Builder::new()
         .name("chathead-shortcuts".to_owned())
         .spawn(move || {
@@ -3231,6 +3531,27 @@ mod tests {
         assert!(metrics.small_font >= 10);
         assert!(metrics.compact_target >= 28);
         assert!(metrics.send_target >= 28);
+    }
+
+    #[test]
+    fn composer_height_grows_between_bounded_zoom_aware_limits() {
+        let metrics = PanelMetrics::for_zoom(PanelZoom::default());
+        assert_eq!(metrics.composer_height, 46);
+        assert_eq!(metrics.composer_view_height, 42);
+        assert_eq!(metrics.composer_max_height, 120);
+        assert!(metrics.composer_max_height > metrics.composer_view_height);
+    }
+
+    #[test]
+    fn transcript_scroll_step_moves_partway_without_overshooting() {
+        assert_eq!(transcript_scroll_step(0.0, 100.0, 0.3), 30.0);
+        assert_eq!(transcript_scroll_step(100.0, 0.0, 0.3), 70.0);
+    }
+
+    #[test]
+    fn transcript_scroll_step_clamps_invalid_factors() {
+        assert_eq!(transcript_scroll_step(10.0, 30.0, -1.0), 10.0);
+        assert_eq!(transcript_scroll_step(10.0, 30.0, 2.0), 30.0);
     }
 
     #[test]

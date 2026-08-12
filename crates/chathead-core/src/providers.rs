@@ -1,9 +1,10 @@
 use std::{collections::HashMap, env};
 
 use crate::{
-    AuthMethod, AuthenticationState, BackendSnapshot, ErrorCode, ExperimentalChatSnapshot,
-    ExperimentalChatState, IpcError, LaunchReadiness, ProviderId, ProviderKind, ProviderSnapshot,
-    ProviderStatus, ShortcutStatus, VoiceSnapshot,
+    AuthMethod, AuthenticationState, BackendSnapshot, DesktopIntegrationSnapshot,
+    DesktopIntegrationStatus, ErrorCode, ExperimentalChatSnapshot, ExperimentalChatState, IpcError,
+    LaunchBlocker, LaunchReadiness, ProviderId, ProviderKind, ProviderSnapshot, ProviderStatus,
+    ShortcutStatus, VoiceSnapshot,
 };
 
 const KEYRING_SERVICE: &str = "io.github.chathead_ai.ChatHead";
@@ -99,6 +100,7 @@ pub struct Backend {
     shortcut_status: ShortcutStatus,
     panel_shortcut_status: ShortcutStatus,
     experimental_chat: ExperimentalChatSnapshot,
+    desktop_integration: DesktopIntegrationSnapshot,
 }
 
 impl Default for Backend {
@@ -137,6 +139,7 @@ impl Backend {
                 state: ExperimentalChatState::Probing,
                 message: Some("Checking ChatGPT subscription…".to_owned()),
             },
+            desktop_integration: DesktopIntegrationSnapshot::layer_shell_ready(),
         }
     }
 
@@ -161,6 +164,7 @@ impl Backend {
         BackendSnapshot {
             providers,
             launch_readiness: self.launch_readiness(),
+            desktop_integration: self.desktop_integration.clone(),
             overlay_running: self.overlay_running,
             voice: self.voice.clone(),
             shortcut_status: self.shortcut_status.clone(),
@@ -239,7 +243,7 @@ impl Backend {
 
     #[must_use]
     pub fn launch_readiness(&self) -> LaunchReadiness {
-        let ready = PROVIDERS
+        let provider_ready = PROVIDERS
             .iter()
             .filter(|provider| provider.kind == ProviderKind::LargeLanguageModel)
             .any(|provider| {
@@ -248,11 +252,24 @@ impl Backend {
                     Some(ProviderStatus::Authenticated { .. })
                 )
             });
-        if ready {
-            LaunchReadiness::Ready
-        } else {
-            LaunchReadiness::MissingLaunchProvider
+        let mut blockers = Vec::with_capacity(2);
+        if !provider_ready {
+            blockers.push(LaunchBlocker::MissingLaunchProvider);
         }
+        match self.desktop_integration.status {
+            DesktopIntegrationStatus::Ready => {}
+            DesktopIntegrationStatus::NotInstalled | DesktopIntegrationStatus::Disabled => {
+                blockers.push(LaunchBlocker::DesktopIntegrationRequired);
+            }
+            DesktopIntegrationStatus::Incompatible | DesktopIntegrationStatus::Unavailable => {
+                blockers.push(LaunchBlocker::DesktopIntegrationUnavailable);
+            }
+        }
+        LaunchReadiness::from_blockers(blockers)
+    }
+
+    pub fn set_desktop_integration(&mut self, integration: DesktopIntegrationSnapshot) {
+        self.desktop_integration = integration;
     }
 
     pub fn set_overlay_running(&mut self, running: bool) {
@@ -412,6 +429,7 @@ mod tests {
                 state: ExperimentalChatState::Unavailable,
                 message: None,
             },
+            desktop_integration: DesktopIntegrationSnapshot::layer_shell_ready(),
         };
         backend.statuses.insert(
             ProviderId::Zep,
@@ -421,7 +439,7 @@ mod tests {
         );
         assert_eq!(
             backend.launch_readiness(),
-            LaunchReadiness::MissingLaunchProvider
+            LaunchReadiness::from_blockers(vec![LaunchBlocker::MissingLaunchProvider])
         );
     }
 
@@ -439,6 +457,7 @@ mod tests {
                 state: ExperimentalChatState::Unavailable,
                 message: None,
             },
+            desktop_integration: DesktopIntegrationSnapshot::layer_shell_ready(),
         };
         backend.statuses.insert(
             ProviderId::Claude,
@@ -446,7 +465,51 @@ mod tests {
                 method: AuthMethod::ApiKey,
             },
         );
-        assert_eq!(backend.launch_readiness(), LaunchReadiness::Ready);
+        assert_eq!(
+            backend.launch_readiness(),
+            LaunchReadiness::from_blockers(Vec::new())
+        );
+    }
+
+    #[test]
+    fn launch_reports_provider_and_desktop_blockers_together() {
+        let mut backend = Backend {
+            statuses: HashMap::new(),
+            overlay_running: false,
+            voice: VoiceSnapshot::default(),
+            shortcut_status: ShortcutStatus::Registering,
+            panel_shortcut_status: ShortcutStatus::Registering,
+            experimental_chat: ExperimentalChatSnapshot {
+                provider_id: ProviderId::ChatGpt,
+                experimental: true,
+                state: ExperimentalChatState::Unavailable,
+                message: None,
+            },
+            desktop_integration: DesktopIntegrationSnapshot {
+                kind: crate::DesktopIntegrationKind::GnomeShell,
+                status: DesktopIntegrationStatus::NotInstalled,
+                gnome_version: Some("46".to_owned()),
+                message: None,
+            },
+        };
+        assert_eq!(
+            backend.launch_readiness(),
+            LaunchReadiness::from_blockers(vec![
+                LaunchBlocker::MissingLaunchProvider,
+                LaunchBlocker::DesktopIntegrationRequired,
+            ])
+        );
+
+        backend.statuses.insert(
+            ProviderId::Claude,
+            ProviderStatus::Authenticated {
+                method: AuthMethod::ApiKey,
+            },
+        );
+        assert_eq!(
+            backend.launch_readiness(),
+            LaunchReadiness::from_blockers(vec![LaunchBlocker::DesktopIntegrationRequired])
+        );
     }
 
     #[test]

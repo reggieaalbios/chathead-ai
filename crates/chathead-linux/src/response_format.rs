@@ -3,15 +3,18 @@
 use std::fmt::Write as _;
 
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag};
+use serde::Serialize;
 use url::Url;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct ResponseDocument {
     pub(crate) source: String,
     pub(crate) blocks: Vec<ResponseBlock>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", content = "content", rename_all = "camelCase")]
 pub(crate) enum ResponseBlock {
     Paragraph(Vec<InlineSpan>),
     Heading {
@@ -43,19 +46,22 @@ pub(crate) enum ResponseBlock {
     Literal(String),
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct ListItem {
     pub(crate) checked: Option<bool>,
     pub(crate) blocks: Vec<ResponseBlock>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct DefinitionItem {
     pub(crate) term: Vec<InlineSpan>,
     pub(crate) definitions: Vec<Vec<ResponseBlock>>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) enum TableAlignment {
     None,
     Left,
@@ -63,7 +69,8 @@ pub(crate) enum TableAlignment {
     Right,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", content = "content", rename_all = "camelCase")]
 pub(crate) enum InlineSpan {
     Text(String),
     Emphasis(Vec<InlineSpan>),

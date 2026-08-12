@@ -67,7 +67,16 @@ export function App(): React.JSX.Element {
     finally { setBusy(false) }
   }
 
-  const launchDisabled = busy || Boolean(unavailable) || (!snapshot?.overlayRunning && snapshot?.launchReadiness !== 'ready')
+  async function installDesktopIntegration(): Promise<void> {
+    if (!window.confirm('Install and enable the ChatHead GNOME Shell extension for your current user?')) return
+    setBusy(true)
+    try { setSnapshot(await window.chathead.backend.installDesktopIntegration()) }
+    catch (error) { setUnavailable(error instanceof Error ? error.message : String(error)) }
+    finally { setBusy(false) }
+  }
+
+  const launchDisabled = busy || Boolean(unavailable) || (!snapshot?.overlayRunning && snapshot?.launchReadiness.ready !== true)
+  const integration = snapshot?.desktopIntegration
 
   return (
     <main className="app-shell" data-theme={resolvedAppearance}>
@@ -92,7 +101,15 @@ export function App(): React.JSX.Element {
               {busy && <LoaderCircle className="spin" size={16} />}
               {snapshot?.overlayRunning ? 'Stop ChatHead' : 'Launch ChatHead'}
             </button>
-            <p>{snapshot?.launchReadiness === 'ready' ? 'Your assistant is ready.' : 'Connect at least one AI provider to launch.'}</p>
+            <p>{snapshot?.launchReadiness.ready
+              ? 'Your assistant is ready.'
+              : snapshot?.launchReadiness.blockers.includes('missingLaunchProvider')
+                ? 'Connect at least one AI provider to launch.'
+                : integration?.message ?? 'Desktop integration is unavailable.'}</p>
+            {integration?.kind === 'gnomeShell' && integration.status !== 'ready' && integration.status !== 'incompatible' && <div className="desktop-integration-status">
+              <span>GNOME 46 integration · {integration.status === 'notInstalled' ? 'Not installed' : 'Needs activation'}</span>
+              <button disabled={busy} onClick={() => void installDesktopIntegration()}>{integration.status === 'notInstalled' ? 'Install' : 'Repair / update'}</button>
+            </div>}
           </div>
 
           {unavailable && <div className="backend-error" role="alert">{unavailable}</div>}

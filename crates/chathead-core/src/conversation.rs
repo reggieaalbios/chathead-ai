@@ -1,14 +1,17 @@
 //! UI-independent reducer for the single experimental conversation.
 
 use crate::{CodexEvent, CodexServiceError};
+use serde::Serialize;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub enum MessageRole {
     User,
     Assistant,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub enum MessageState {
     Complete,
     Streaming,
@@ -16,7 +19,8 @@ pub enum MessageState {
     Failed,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ChatMessage {
     pub id: String,
     pub role: MessageRole,

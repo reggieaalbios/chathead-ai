@@ -9,7 +9,8 @@ const zepOnlySnapshot: BackendSnapshot = {
     { id: 'chatgpt', name: 'ChatGPT', description: 'OpenAI', kind: 'largeLanguageModel', apiKeyLabel: 'OpenAI API key', supportsSubscription: true, status: { state: 'unconfigured' } },
     { id: 'zep', name: 'Zep', description: 'Memory', kind: 'memoryContext', apiKeyLabel: 'Zep API key', supportsSubscription: false, status: { state: 'authenticated', method: 'apiKey' } }
   ],
-  launchReadiness: 'missingLaunchProvider', overlayRunning: false,
+  launchReadiness: { ready: false, blockers: ['missingLaunchProvider'] },
+  desktopIntegration: { kind: 'layerShell', status: 'ready' }, overlayRunning: false,
   voice: {
     enabled: false, phase: 'disabled', interactionMode: 'hold', submissionMode: 'insertOnly', inputDevices: [], microphoneAccess: 'unknown',
     selectedModelId: 'sherpa-onnx-whisper-tiny-int8-multilingual-v1', models: [
@@ -24,7 +25,7 @@ const zepOnlySnapshot: BackendSnapshot = {
 }
 
 const getSnapshot = vi.fn(async () => zepOnlySnapshot)
-const saveApiKey = vi.fn(async () => ({ ...zepOnlySnapshot, launchReadiness: 'ready' as const }))
+const saveApiKey = vi.fn(async () => ({ ...zepOnlySnapshot, launchReadiness: { ready: true, blockers: [] } }))
 const setPanelPosition = vi.fn(async () => zepOnlySnapshot)
 const setPanelZoom = vi.fn(async () => zepOnlySnapshot)
 const setPanelSize = vi.fn(async () => zepOnlySnapshot)
@@ -40,6 +41,7 @@ beforeEach(() => {
   window.chathead = {
     backend: {
       getSnapshot, saveApiKey, connectSubscription: vi.fn(), disconnectProvider: vi.fn(), launchOverlay: vi.fn(), stopOverlay: vi.fn(),
+      refreshDesktopIntegration: vi.fn(async () => zepOnlySnapshot), installDesktopIntegration: vi.fn(async () => zepOnlySnapshot),
       setOverlayTheme: vi.fn(async () => zepOnlySnapshot), setPanelPosition, setPanelZoom, setPanelSize,
       setVoiceEnabled: vi.fn(async () => zepOnlySnapshot), setVoiceInputDevice: vi.fn(async () => zepOnlySnapshot),
       setVoiceInteractionMode: vi.fn(async () => zepOnlySnapshot), setVoiceSubmissionMode: vi.fn(async () => zepOnlySnapshot), refreshVoiceDevices: vi.fn(async () => zepOnlySnapshot),
@@ -60,6 +62,21 @@ describe('setup application', () => {
   it('keeps launch disabled when only Zep is authenticated', async () => {
     render(<App />)
     expect(await screen.findByRole('button', { name: 'Launch ChatHead' })).toBeDisabled()
+  })
+
+  it('offers a confirmed current-user install when GNOME integration is missing', async () => {
+    vi.spyOn(window, 'confirm').mockReturnValueOnce(true)
+    const gnomeSnapshot: BackendSnapshot = {
+      ...zepOnlySnapshot,
+      launchReadiness: { ready: false, blockers: ['desktopIntegrationRequired'] },
+      desktopIntegration: { kind: 'gnomeShell', status: 'notInstalled', gnomeVersion: '46', message: 'Install the extension.' }
+    }
+    getSnapshot.mockResolvedValueOnce(gnomeSnapshot)
+    vi.mocked(window.chathead.backend.installDesktopIntegration).mockResolvedValueOnce(gnomeSnapshot)
+    render(<App />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Install' }))
+    expect(window.confirm).toHaveBeenCalled()
+    await waitFor(() => expect(window.chathead.backend.installDesktopIntegration).toHaveBeenCalled())
   })
 
   it('opens provider configuration and clears the key input after completion', async () => {

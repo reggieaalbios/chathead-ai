@@ -265,5 +265,9 @@ button:disabled { cursor: not-allowed; }
 .app-shell[data-theme='dark'] .disconnect-action { color: #f0a0af; border-color: rgba(170,68,91,.55); background: rgba(69,22,35,.72); }
 .app-shell[data-theme='dark'] .modal-error { color: #ff9eb1; }
 .spin { animation: spin .75s linear infinite; }
+.desktop-integration-status { display: flex; align-items: center; gap: 10px; color: #536b87; font-size: 12px; }
+.desktop-integration-status button { border: 1px solid rgba(74,119,172,.35); border-radius: 8px; padding: 5px 9px; background: rgba(255,255,255,.72); cursor: pointer; }
+.app-shell[data-theme='dark'] .desktop-integration-status { color: #9eb0c6; }
+.app-shell[data-theme='dark'] .desktop-integration-status button { color: #dbe9f9; border-color: rgba(101,151,211,.54); background: rgba(26,48,76,.82); }
 @keyframes spin { to { transform: rotate(360deg); } }
 @keyframes shimmer { from { opacity: .45; } to { opacity: .9; } }

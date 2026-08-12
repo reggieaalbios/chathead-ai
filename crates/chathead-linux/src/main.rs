@@ -6,8 +6,9 @@ use std::{
 };
 
 use chathead_core::{
-    Backend, CodexAppServer, CodexCommand, CodexEvent, ErrorCode, IpcError, IpcEvent, IpcRequest,
-    IpcResponse, LaunchReadiness, PROTOCOL_VERSION, PanelSize, PanelZoom, ProviderId,
+    Backend, BackendSnapshot, CodexAppServer, CodexCommand, CodexEvent, DesktopIntegrationKind,
+    DesktopIntegrationSnapshot, DesktopIntegrationStatus, ErrorCode, IpcError, IpcEvent,
+    IpcRequest, IpcResponse, LaunchBlocker, PROTOCOL_VERSION, PanelSize, PanelZoom, ProviderId,
     VoiceInteractionMode, VoiceModelId, VoiceSubmissionMode,
 };
 use chathead_voice::{VoiceEvent, VoiceService};
@@ -15,7 +16,9 @@ use gtk::{gio, glib, prelude::*};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+mod desktop_integration;
 mod overlay;
+mod presentation;
 mod response_format;
 mod response_view;
 
@@ -111,6 +114,9 @@ fn start_sidecar(app: &gtk::Application) {
     let application_hold = app.hold();
 
     let backend = Arc::new(Mutex::new(Backend::new()));
+    if let Ok(mut state) = backend.lock() {
+        state.set_desktop_integration(desktop_integration::detect());
+    }
     let voice = VoiceService::start();
     if let Ok(mut state) = backend.lock() {
         state.set_voice_snapshot(voice.snapshot());
@@ -119,6 +125,10 @@ fn start_sidecar(app: &gtk::Application) {
     let output = Arc::new(Mutex::new(BufWriter::new(io::stdout())));
     let (sender, receiver) = mpsc::channel();
     let (shortcut_status_sender, shortcut_status_receiver) = mpsc::channel();
+    let (global_shortcut_sender, global_shortcut_receiver) = mpsc::channel();
+    presentation::export(app);
+    watch_gnome_readiness(&backend, &output);
+    overlay::start_shortcut_service(global_shortcut_sender);
     start_stdin_reader(sender);
 
     if let Ok(state) = backend.lock() {
@@ -159,6 +169,7 @@ fn start_sidecar(app: &gtk::Application) {
                 ),
                 Input::Closed => {
                     overlay::stop_native_overlay(&app);
+                    presentation::stop();
                     app.quit();
                     return glib::ControlFlow::Break;
                 }
@@ -183,8 +194,67 @@ fn start_sidecar(app: &gtk::Application) {
                 write_snapshot_changed(&output, state.snapshot());
             }
         }
+        while let Ok(event) = global_shortcut_receiver.try_recv() {
+            if let Some(shortcut_status) = event.shortcut_status_update()
+                && let Ok(mut state) = backend.lock()
+            {
+                match shortcut_status.action {
+                    overlay::ShortcutAction::Voice => {
+                        state.set_shortcut_status(shortcut_status.status);
+                    }
+                    overlay::ShortcutAction::Panel => {
+                        state.set_panel_shortcut_status(shortcut_status.status);
+                    }
+                }
+                write_snapshot_changed(&output, state.snapshot());
+            }
+            overlay::handle_global_app_event(&event);
+            presentation::handle_global_app_event(&event);
+        }
         glib::ControlFlow::Continue
     });
+}
+
+fn watch_gnome_readiness(backend: &Arc<Mutex<Backend>>, output: &Output) {
+    let appeared_backend = backend.clone();
+    let appeared_output = output.clone();
+    let vanished_backend = backend.clone();
+    let vanished_output = output.clone();
+    let _readiness_watcher = gio::bus_watch_name(
+        gio::BusType::Session,
+        desktop_integration::READINESS_BUS_NAME,
+        gio::BusNameWatcherFlags::NONE,
+        move |_, _, _| {
+            if let Ok(mut state) = appeared_backend.lock()
+                && state.snapshot().desktop_integration.kind == DesktopIntegrationKind::GnomeShell
+            {
+                state.set_desktop_integration(desktop_integration::detect());
+                write_snapshot_changed(&appeared_output, state.snapshot());
+            }
+        },
+        move |_, _| {
+            if let Ok(mut state) = vanished_backend.lock() {
+                let snapshot = state.snapshot();
+                if snapshot.desktop_integration.kind != DesktopIntegrationKind::GnomeShell {
+                    return;
+                }
+                state.set_desktop_integration(DesktopIntegrationSnapshot {
+                    kind: DesktopIntegrationKind::GnomeShell,
+                    status: DesktopIntegrationStatus::Disabled,
+                    gnome_version: snapshot.desktop_integration.gnome_version,
+                    message: Some(
+                        "Enable the ChatHead GNOME extension, then log out and back in if GNOME cannot activate it live."
+                            .to_owned(),
+                    ),
+                });
+                if snapshot.overlay_running {
+                    presentation::stop();
+                    state.set_overlay_running(false);
+                }
+                write_snapshot_changed(&vanished_output, state.snapshot());
+            }
+        },
+    );
 }
 
 fn start_stdin_reader(sender: mpsc::Sender<Input>) {
@@ -236,254 +306,219 @@ fn handle_request(
 
     let id = request.id;
     let publish_response_snapshot = publishes_response_snapshot(&request.method);
-    let result = match request.method.as_str() {
-        "getSnapshot" => backend
-            .lock()
-            .map(|state| state.snapshot())
-            .map_err(lock_error),
-        "saveApiKey" => parse::<SaveApiKeyParams>(request.params).and_then(|params| {
-            backend
-                .lock()
-                .map_err(lock_error)?
-                .save_api_key(params.provider_id, &params.api_key)
-                .map_err(IpcError::from)?;
-            backend
+    let result =
+        match request.method.as_str() {
+            "getSnapshot" => backend
                 .lock()
                 .map(|state| state.snapshot())
-                .map_err(lock_error)
-        }),
-        "connectSubscription" => parse::<ProviderParams>(request.params).and_then(|params| {
-            backend
-                .lock()
-                .map_err(lock_error)?
-                .begin_subscription_login(params.provider_id)
-                .map_err(IpcError::from)?;
-            codex.send(CodexCommand::Login).map_err(codex_error)?;
-            backend
-                .lock()
-                .map(|state| state.snapshot())
-                .map_err(lock_error)
-        }),
-        "disconnectProvider" => parse::<ProviderParams>(request.params).and_then(|params| {
-            let subscription_logout = backend
-                .lock()
-                .map_err(lock_error)?
-                .snapshot()
-                .providers
-                .into_iter()
-                .find(|provider| provider.id == params.provider_id)
-                .is_some_and(|provider| {
-                    matches!(
-                        provider.status,
-                        chathead_core::ProviderStatus::Authenticated {
-                            method: chathead_core::AuthMethod::SubscriptionLogin
-                        }
-                    )
-                });
-            backend
-                .lock()
-                .map_err(lock_error)?
-                .disconnect_provider(params.provider_id)
-                .map_err(IpcError::from)?;
-            if subscription_logout {
-                codex.send(CodexCommand::Logout).map_err(codex_error)?;
+                .map_err(lock_error),
+            "saveApiKey" => parse::<SaveApiKeyParams>(request.params).and_then(|params| {
+                backend
+                    .lock()
+                    .map_err(lock_error)?
+                    .save_api_key(params.provider_id, &params.api_key)
+                    .map_err(IpcError::from)?;
+                backend
+                    .lock()
+                    .map(|state| state.snapshot())
+                    .map_err(lock_error)
+            }),
+            "connectSubscription" => parse::<ProviderParams>(request.params).and_then(|params| {
+                backend
+                    .lock()
+                    .map_err(lock_error)?
+                    .begin_subscription_login(params.provider_id)
+                    .map_err(IpcError::from)?;
+                codex.send(CodexCommand::Login).map_err(codex_error)?;
+                backend
+                    .lock()
+                    .map(|state| state.snapshot())
+                    .map_err(lock_error)
+            }),
+            "disconnectProvider" => parse::<ProviderParams>(request.params).and_then(|params| {
+                let subscription_logout = backend
+                    .lock()
+                    .map_err(lock_error)?
+                    .snapshot()
+                    .providers
+                    .into_iter()
+                    .find(|provider| provider.id == params.provider_id)
+                    .is_some_and(|provider| {
+                        matches!(
+                            provider.status,
+                            chathead_core::ProviderStatus::Authenticated {
+                                method: chathead_core::AuthMethod::SubscriptionLogin
+                            }
+                        )
+                    });
+                backend
+                    .lock()
+                    .map_err(lock_error)?
+                    .disconnect_provider(params.provider_id)
+                    .map_err(IpcError::from)?;
+                if subscription_logout {
+                    codex.send(CodexCommand::Logout).map_err(codex_error)?;
+                }
+                backend
+                    .lock()
+                    .map(|state| state.snapshot())
+                    .map_err(lock_error)
+            }),
+            "launchOverlay" => {
+                launch_overlay(app, backend, codex, voice, output, shortcut_status_sender)
             }
-            backend
-                .lock()
-                .map(|state| state.snapshot())
-                .map_err(lock_error)
-        }),
-        "launchOverlay" => {
-            let snapshot = backend
-                .lock()
-                .map_err(lock_error)
-                .map(|state| state.snapshot());
-            match snapshot {
-                Ok(snapshot)
-                    if snapshot.launch_readiness == LaunchReadiness::MissingLaunchProvider =>
-                {
-                    Err(IpcError {
-                        code: ErrorCode::AuthFailed,
-                        message: "authenticate at least one LLM provider before launch".to_owned(),
-                        recoverable: true,
-                    })
-                }
-                Ok(snapshot) => {
-                    overlay::start_native_overlay(
-                        app,
-                        codex.clone(),
-                        snapshot.experimental_chat,
-                        voice.clone(),
-                        output.clone(),
-                        shortcut_status_sender.clone(),
-                    )
-                }
-                .map_err(|message| IpcError {
-                    code: ErrorCode::LayerShellUnsupported,
-                    message: message.to_owned(),
-                    recoverable: true,
+            "stopOverlay" => {
+                overlay::stop_native_overlay(app);
+                presentation::stop();
+                let _ = codex.send(CodexCommand::NewChat);
+                backend.lock().map_err(lock_error).map(|mut state| {
+                    state.set_overlay_running(false);
+                    state.snapshot()
                 })
-                .and_then(|()| {
+            }
+            "setOverlayTheme" => parse::<OverlayThemeParams>(request.params).and_then(|params| {
+                overlay::set_native_overlay_theme(app, params.theme);
+                backend
+                    .lock()
+                    .map(|state| state.snapshot())
+                    .map_err(lock_error)
+            }),
+            "setPanelPosition" => parse::<PanelPositionParams>(request.params).and_then(|params| {
+                overlay::set_native_panel_position(params.position);
+                backend
+                    .lock()
+                    .map(|state| state.snapshot())
+                    .map_err(lock_error)
+            }),
+            "setPanelZoom" => parse::<PanelZoomParams>(request.params).and_then(|params| {
+                overlay::set_native_panel_zoom(params.zoom);
+                backend
+                    .lock()
+                    .map(|state| state.snapshot())
+                    .map_err(lock_error)
+            }),
+            "setPanelSize" => parse::<PanelSizeParams>(request.params).and_then(|params| {
+                overlay::set_native_panel_size(params.size);
+                backend
+                    .lock()
+                    .map(|state| state.snapshot())
+                    .map_err(lock_error)
+            }),
+            "refreshDesktopIntegration" => backend.lock().map_err(lock_error).map(|mut state| {
+                state.set_desktop_integration(desktop_integration::detect());
+                state.snapshot()
+            }),
+            "setVoiceEnabled" => parse::<VoiceEnabledParams>(request.params).and_then(|params| {
+                voice.set_enabled(params.enabled).map_err(voice_error)?;
+                backend
+                    .lock()
+                    .map(|state| state.snapshot())
+                    .map_err(lock_error)
+            }),
+            "setVoiceInputDevice" => {
+                parse::<VoiceInputDeviceParams>(request.params).and_then(|params| {
+                    voice
+                        .set_input_device(params.device_id)
+                        .map_err(voice_error)?;
                     backend
                         .lock()
-                        .map_err(lock_error)?
-                        .set_overlay_running(true);
+                        .map(|state| state.snapshot())
+                        .map_err(lock_error)
+                })
+            }
+            "setVoiceInteractionMode" => parse::<VoiceInteractionModeParams>(request.params)
+                .and_then(|params| {
+                    voice
+                        .set_interaction_mode(params.mode)
+                        .map_err(voice_error)?;
                     backend
                         .lock()
                         .map(|state| state.snapshot())
                         .map_err(lock_error)
                 }),
-                Err(error) => Err(error),
+            "setVoiceSubmissionMode" => parse::<VoiceSubmissionModeParams>(request.params)
+                .and_then(|params| {
+                    voice
+                        .set_submission_mode(params.mode)
+                        .map_err(voice_error)?;
+                    backend
+                        .lock()
+                        .map(|state| state.snapshot())
+                        .map_err(lock_error)
+                }),
+            "refreshVoiceDevices" => voice.refresh_devices().map_err(voice_error).and_then(|()| {
+                backend
+                    .lock()
+                    .map(|state| state.snapshot())
+                    .map_err(lock_error)
+            }),
+            "retryVoiceSetup" => voice.retry_setup().map_err(voice_error).and_then(|()| {
+                backend
+                    .lock()
+                    .map(|state| state.snapshot())
+                    .map_err(lock_error)
+            }),
+            "setVoiceModel" => parse::<VoiceModelParams>(request.params).and_then(|params| {
+                voice.set_model(params.model_id).map_err(voice_error)?;
+                backend
+                    .lock()
+                    .map(|state| state.snapshot())
+                    .map_err(lock_error)
+            }),
+            "downloadVoiceModel" => parse::<VoiceModelParams>(request.params).and_then(|params| {
+                voice.download_model(params.model_id).map_err(voice_error)?;
+                backend
+                    .lock()
+                    .map(|state| state.snapshot())
+                    .map_err(lock_error)
+            }),
+            "cancelVoiceModelDownload" => {
+                parse::<VoiceModelParams>(request.params).and_then(|params| {
+                    voice
+                        .cancel_model_download(params.model_id)
+                        .map_err(voice_error)?;
+                    backend
+                        .lock()
+                        .map(|state| state.snapshot())
+                        .map_err(lock_error)
+                })
             }
-        }
-        "stopOverlay" => {
-            overlay::stop_native_overlay(app);
-            let _ = codex.send(CodexCommand::NewChat);
-            backend.lock().map_err(lock_error).map(|mut state| {
-                state.set_overlay_running(false);
-                state.snapshot()
-            })
-        }
-        "setOverlayTheme" => parse::<OverlayThemeParams>(request.params).and_then(|params| {
-            overlay::set_native_overlay_theme(app, params.theme);
-            backend
-                .lock()
-                .map(|state| state.snapshot())
-                .map_err(lock_error)
-        }),
-        "setPanelPosition" => parse::<PanelPositionParams>(request.params).and_then(|params| {
-            overlay::set_native_panel_position(params.position);
-            backend
-                .lock()
-                .map(|state| state.snapshot())
-                .map_err(lock_error)
-        }),
-        "setPanelZoom" => parse::<PanelZoomParams>(request.params).and_then(|params| {
-            overlay::set_native_panel_zoom(params.zoom);
-            backend
-                .lock()
-                .map(|state| state.snapshot())
-                .map_err(lock_error)
-        }),
-        "setPanelSize" => parse::<PanelSizeParams>(request.params).and_then(|params| {
-            overlay::set_native_panel_size(params.size);
-            backend
-                .lock()
-                .map(|state| state.snapshot())
-                .map_err(lock_error)
-        }),
-        "setVoiceEnabled" => parse::<VoiceEnabledParams>(request.params).and_then(|params| {
-            voice.set_enabled(params.enabled).map_err(voice_error)?;
-            backend
-                .lock()
-                .map(|state| state.snapshot())
-                .map_err(lock_error)
-        }),
-        "setVoiceInputDevice" => {
-            parse::<VoiceInputDeviceParams>(request.params).and_then(|params| {
-                voice
-                    .set_input_device(params.device_id)
-                    .map_err(voice_error)?;
+            "removeVoiceModel" => parse::<VoiceModelParams>(request.params).and_then(|params| {
+                voice.remove_model(params.model_id).map_err(voice_error)?;
                 backend
                     .lock()
                     .map(|state| state.snapshot())
                     .map_err(lock_error)
-            })
-        }
-        "setVoiceInteractionMode" => {
-            parse::<VoiceInteractionModeParams>(request.params).and_then(|params| {
-                voice
-                    .set_interaction_mode(params.mode)
-                    .map_err(voice_error)?;
+            }),
+            "startVoiceTest" => voice.start_test().map_err(voice_error).and_then(|()| {
                 backend
                     .lock()
                     .map(|state| state.snapshot())
                     .map_err(lock_error)
-            })
-        }
-        "setVoiceSubmissionMode" => {
-            parse::<VoiceSubmissionModeParams>(request.params).and_then(|params| {
-                voice
-                    .set_submission_mode(params.mode)
-                    .map_err(voice_error)?;
+            }),
+            "stopVoiceTest" => voice.stop_test().map_err(voice_error).and_then(|()| {
                 backend
                     .lock()
                     .map(|state| state.snapshot())
                     .map_err(lock_error)
-            })
-        }
-        "refreshVoiceDevices" => voice.refresh_devices().map_err(voice_error).and_then(|()| {
-            backend
-                .lock()
-                .map(|state| state.snapshot())
-                .map_err(lock_error)
-        }),
-        "retryVoiceSetup" => voice.retry_setup().map_err(voice_error).and_then(|()| {
-            backend
-                .lock()
-                .map(|state| state.snapshot())
-                .map_err(lock_error)
-        }),
-        "setVoiceModel" => parse::<VoiceModelParams>(request.params).and_then(|params| {
-            voice.set_model(params.model_id).map_err(voice_error)?;
-            backend
-                .lock()
-                .map(|state| state.snapshot())
-                .map_err(lock_error)
-        }),
-        "downloadVoiceModel" => parse::<VoiceModelParams>(request.params).and_then(|params| {
-            voice.download_model(params.model_id).map_err(voice_error)?;
-            backend
-                .lock()
-                .map(|state| state.snapshot())
-                .map_err(lock_error)
-        }),
-        "cancelVoiceModelDownload" => {
-            parse::<VoiceModelParams>(request.params).and_then(|params| {
-                voice
-                    .cancel_model_download(params.model_id)
-                    .map_err(voice_error)?;
-                backend
-                    .lock()
-                    .map(|state| state.snapshot())
-                    .map_err(lock_error)
-            })
-        }
-        "removeVoiceModel" => parse::<VoiceModelParams>(request.params).and_then(|params| {
-            voice.remove_model(params.model_id).map_err(voice_error)?;
-            backend
-                .lock()
-                .map(|state| state.snapshot())
-                .map_err(lock_error)
-        }),
-        "startVoiceTest" => voice.start_test().map_err(voice_error).and_then(|()| {
-            backend
-                .lock()
-                .map(|state| state.snapshot())
-                .map_err(lock_error)
-        }),
-        "stopVoiceTest" => voice.stop_test().map_err(voice_error).and_then(|()| {
-            backend
-                .lock()
-                .map(|state| state.snapshot())
-                .map_err(lock_error)
-        }),
-        "shutdown" => {
-            overlay::stop_native_overlay(app);
-            let _ = codex.send(CodexCommand::Shutdown);
-            write_message(
-                output,
-                &IpcResponse::success(id, json!({ "shuttingDown": true })),
-            );
-            app.quit();
-            return;
-        }
-        _ => Err(IpcError {
-            code: ErrorCode::UnsupportedOperation,
-            message: "unsupported IPC method".to_owned(),
-            recoverable: true,
-        }),
-    };
+            }),
+            "shutdown" => {
+                overlay::stop_native_overlay(app);
+                presentation::stop();
+                let _ = codex.send(CodexCommand::Shutdown);
+                write_message(
+                    output,
+                    &IpcResponse::success(id, json!({ "shuttingDown": true })),
+                );
+                app.quit();
+                return;
+            }
+            _ => Err(IpcError {
+                code: ErrorCode::UnsupportedOperation,
+                message: "unsupported IPC method".to_owned(),
+                recoverable: true,
+            }),
+        };
 
     match result {
         Ok(snapshot) => {
@@ -501,6 +536,87 @@ fn handle_request(
         }
         Err(error) => write_message(output, &IpcResponse::<Value>::failure(id, error)),
     }
+}
+
+fn launch_overlay(
+    app: &gtk::Application,
+    backend: &Arc<Mutex<Backend>>,
+    codex: &CodexAppServer,
+    voice: &VoiceService,
+    output: &Output,
+    shortcut_status_sender: &mpsc::Sender<overlay::ShortcutStatusUpdate>,
+) -> Result<BackendSnapshot, IpcError> {
+    let snapshot = backend
+        .lock()
+        .map_err(lock_error)
+        .map(|state| state.snapshot())?;
+    if !snapshot.launch_readiness.ready {
+        let integration_required = snapshot
+            .launch_readiness
+            .blockers
+            .contains(&LaunchBlocker::DesktopIntegrationRequired);
+        let integration_unavailable = snapshot
+            .launch_readiness
+            .blockers
+            .contains(&LaunchBlocker::DesktopIntegrationUnavailable);
+        return Err(IpcError {
+            code: if integration_required {
+                ErrorCode::DesktopIntegrationRequired
+            } else if integration_unavailable {
+                ErrorCode::DesktopIntegrationUnavailable
+            } else {
+                ErrorCode::AuthFailed
+            },
+            message: if integration_required {
+                "desktop integration must be installed or enabled before launch"
+            } else if integration_unavailable {
+                "desktop integration is unavailable for this session"
+            } else {
+                "authenticate at least one LLM provider before launch"
+            }
+            .to_owned(),
+            recoverable: true,
+        });
+    }
+
+    match snapshot.desktop_integration.kind {
+        DesktopIntegrationKind::GnomeShell => {
+            presentation::start(
+                codex.clone(),
+                snapshot.experimental_chat,
+                voice.clone(),
+                output.clone(),
+            );
+        }
+        DesktopIntegrationKind::LayerShell => overlay::start_native_overlay(
+            app,
+            codex.clone(),
+            snapshot.experimental_chat,
+            voice.clone(),
+            output.clone(),
+            shortcut_status_sender.clone(),
+        )
+        .map_err(|message| IpcError {
+            code: ErrorCode::DesktopIntegrationUnavailable,
+            message: message.to_owned(),
+            recoverable: true,
+        })?,
+        DesktopIntegrationKind::Unsupported => {
+            return Err(IpcError {
+                code: ErrorCode::DesktopIntegrationUnavailable,
+                message: "desktop integration is unavailable for this session".to_owned(),
+                recoverable: true,
+            });
+        }
+    }
+    backend
+        .lock()
+        .map_err(lock_error)?
+        .set_overlay_running(true);
+    backend
+        .lock()
+        .map(|state| state.snapshot())
+        .map_err(lock_error)
 }
 
 fn codex_error(_: chathead_core::CodexServiceError) -> IpcError {
@@ -542,6 +658,7 @@ fn handle_voice_event(
         );
     } else {
         overlay::handle_voice_event(app, &event);
+        presentation::handle_voice_event(&event);
     }
 }
 
@@ -585,6 +702,7 @@ fn handle_codex_event(
         _ => {}
     }
     overlay::handle_codex_event(app, &event);
+    presentation::handle_codex_event(&event);
 }
 
 fn write_snapshot_changed(output: &Output, snapshot: chathead_core::BackendSnapshot) {

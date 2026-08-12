@@ -1,6 +1,6 @@
 import { z } from 'zod'
 
-export const PROTOCOL_VERSION = 10 as const
+export const PROTOCOL_VERSION = 11 as const
 
 export const providerIds = ['chatgpt', 'claude', 'gemini', 'grok', 'zep'] as const
 export type ProviderId = (typeof providerIds)[number]
@@ -15,7 +15,8 @@ export type ErrorCode =
   | 'CREDENTIAL_STORE_UNAVAILABLE'
   | 'CODEX_NOT_FOUND'
   | 'AUTH_FAILED'
-  | 'LAYER_SHELL_UNSUPPORTED'
+  | 'DESKTOP_INTEGRATION_REQUIRED'
+  | 'DESKTOP_INTEGRATION_UNAVAILABLE'
   | 'SIDECAR_UNAVAILABLE'
   | 'PROTOCOL_MISMATCH'
   | 'INVALID_REQUEST'
@@ -84,7 +85,16 @@ export interface ProviderSnapshot {
 
 export interface BackendSnapshot {
   providers: ProviderSnapshot[]
-  launchReadiness: 'ready' | 'missingLaunchProvider'
+  launchReadiness: {
+    ready: boolean
+    blockers: Array<'missingLaunchProvider' | 'desktopIntegrationRequired' | 'desktopIntegrationUnavailable'>
+  }
+  desktopIntegration: {
+    kind: 'layerShell' | 'gnomeShell' | 'unsupported'
+    status: 'ready' | 'notInstalled' | 'disabled' | 'incompatible' | 'unavailable'
+    gnomeVersion?: string
+    message?: string
+  }
   overlayRunning: boolean
   voice: VoiceSnapshot
   shortcutStatus:
@@ -110,6 +120,8 @@ export interface BackendApi {
   disconnectProvider(providerId: ProviderId): Promise<BackendSnapshot>
   launchOverlay(): Promise<BackendSnapshot>
   stopOverlay(): Promise<BackendSnapshot>
+  refreshDesktopIntegration(): Promise<BackendSnapshot>
+  installDesktopIntegration(): Promise<BackendSnapshot>
   setOverlayTheme(theme: ResolvedAppearance): Promise<BackendSnapshot>
   setPanelPosition(position: PanelPosition): Promise<BackendSnapshot>
   setPanelZoom(zoom: PanelZoom): Promise<BackendSnapshot>
@@ -179,7 +191,16 @@ export const backendSnapshotSchema = z.object({
     id: z.enum(providerIds), name: z.string(), description: z.string(), kind: z.enum(['largeLanguageModel', 'memoryContext']),
     apiKeyLabel: z.string(), supportsSubscription: z.boolean(), status: providerStatusSchema
   })),
-  launchReadiness: z.enum(['ready', 'missingLaunchProvider']),
+  launchReadiness: z.object({
+    ready: z.boolean(),
+    blockers: z.array(z.enum(['missingLaunchProvider', 'desktopIntegrationRequired', 'desktopIntegrationUnavailable']))
+  }),
+  desktopIntegration: z.object({
+    kind: z.enum(['layerShell', 'gnomeShell', 'unsupported']),
+    status: z.enum(['ready', 'notInstalled', 'disabled', 'incompatible', 'unavailable']),
+    gnomeVersion: z.string().optional(),
+    message: z.string().optional()
+  }),
   overlayRunning: z.boolean(),
   voice: voiceSnapshotSchema,
   shortcutStatus: z.union([

@@ -1,4 +1,7 @@
 import { join } from 'node:path'
+import { execFile } from 'node:child_process'
+import { mkdtemp, readdir, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
 import { app, BrowserWindow, ipcMain, Menu, nativeImage, session, shell, Tray } from 'electron'
 import type { BackendSnapshot, PanelPosition, PanelSize, PanelZoom, ProviderId, ResolvedAppearance, VoiceInteractionMode, VoiceModelId, VoiceSubmissionMode } from '../shared/backend'
 import { SidecarManager } from './sidecar'
@@ -85,7 +88,7 @@ function refreshTrayMenu(): void {
   const running = latestSnapshot?.overlayRunning ?? false
   tray?.setContextMenu(Menu.buildFromTemplate([
     { label: 'Open Settings', click: showWindow },
-    { label: running ? 'Stop ChatHead' : 'Launch ChatHead', enabled: latestSnapshot?.launchReadiness === 'ready' || running, click: () => void (running ? sidecar.stopOverlay() : sidecar.launchOverlay()) },
+    { label: running ? 'Stop ChatHead' : 'Launch ChatHead', enabled: latestSnapshot?.launchReadiness.ready === true || running, click: () => void (running ? sidecar.stopOverlay() : sidecar.launchOverlay()) },
     { type: 'separator' },
     { label: 'Quit', click: () => app.quit() }
   ]))
@@ -105,6 +108,11 @@ function registerIpc(): void {
   ipcMain.handle('backend:disconnectProvider', (_event, providerId: ProviderId) => sidecar.disconnectProvider(providerId))
   ipcMain.handle('backend:launchOverlay', () => sidecar.launchOverlay())
   ipcMain.handle('backend:stopOverlay', () => sidecar.stopOverlay())
+  ipcMain.handle('backend:refreshDesktopIntegration', () => sidecar.refreshDesktopIntegration())
+  ipcMain.handle('backend:installDesktopIntegration', async () => {
+    await installBundledGnomeExtension()
+    return sidecar.refreshDesktopIntegration()
+  })
   ipcMain.handle('backend:setOverlayTheme', (_event, theme: ResolvedAppearance) => sidecar.setOverlayTheme(theme))
   ipcMain.handle('backend:setPanelPosition', (_event, position: PanelPosition) => sidecar.setPanelPosition(position))
   ipcMain.handle('backend:setPanelZoom', (_event, zoom: PanelZoom) => sidecar.setPanelZoom(zoom))
@@ -124,6 +132,68 @@ function registerIpc(): void {
   ipcMain.handle('backend:shutdown', () => sidecar.shutdown())
   ipcMain.on('window:minimize', () => window?.minimize())
   ipcMain.on('window:close', () => window?.hide())
+}
+
+async function installBundledGnomeExtension(): Promise<void> {
+  if (latestSnapshot?.desktopIntegration.kind !== 'gnomeShell') {
+    throw new Error('DESKTOP_INTEGRATION_UNAVAILABLE: GNOME Shell integration is not applicable in this session.')
+  }
+  if (latestSnapshot.desktopIntegration.gnomeVersion !== '46') {
+    throw new Error('DESKTOP_INTEGRATION_UNAVAILABLE: ChatHead currently supports GNOME Shell 46 only.')
+  }
+
+  const source = app.isPackaged
+    ? join(process.resourcesPath, 'gnome-extension', 'chathead-ai@io.github.chathead-ai')
+    : join(app.getAppPath(), 'gnome-extension', 'chathead-ai@io.github.chathead-ai')
+  const staging = await mkdtemp(join(tmpdir(), 'chathead-gnome-extension-'))
+  try {
+    await runExtensionCommand([
+      'pack', '--force', '--out-dir', staging,
+      '--extra-source', 'chathead-orb.svg', '.'
+    ], source)
+    const archive = (await readdir(staging)).find((entry) => entry.endsWith('.zip'))
+    if (!archive) throw new Error('GNOME extension packaging did not produce an archive.')
+    await runExtensionCommand(['install', '--force', join(staging, archive)])
+    try {
+      await runExtensionCommand(['enable', 'chathead-ai@io.github.chathead-ai'])
+    } catch (error) {
+      // GNOME Shell 46 does not necessarily discover a newly installed local
+      // extension until the next login. The files are installed successfully;
+      // readiness will report the extension as disabled until Shell loads it.
+      if (!(error instanceof ExtensionCommandError) || !error.extensionIsUnknown) throw error
+    }
+  } finally {
+    await rm(staging, { recursive: true, force: true })
+  }
+}
+
+class ExtensionCommandError extends Error {
+  readonly extensionIsUnknown: boolean
+
+  constructor(action: string, stderr: string) {
+    const diagnostic = sanitizeCommandDiagnostic(stderr)
+    super(`GNOME could not ${action} the ChatHead extension.${diagnostic ? ` ${diagnostic}` : ''}`)
+    this.name = 'ExtensionCommandError'
+    this.extensionIsUnknown = /(?:does not exist|doesn't exist)/i.test(stderr)
+  }
+}
+
+function sanitizeCommandDiagnostic(stderr: string): string {
+  const line = stderr.split(/\r?\n/u).map((value) => value.trim()).find(Boolean)
+  if (!line) return ''
+  return Array.from(line, (character) => {
+    const codePoint = character.codePointAt(0) ?? 0
+    return codePoint < 32 || codePoint === 127 ? '' : character
+  }).join('').slice(0, 240)
+}
+
+function runExtensionCommand(arguments_: string[], cwd?: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    execFile('gnome-extensions', arguments_, { cwd, timeout: 30_000, windowsHide: true }, (error, _stdout, stderr) => {
+      if (error) reject(new ExtensionCommandError(arguments_[0] ?? 'manage', stderr))
+      else resolve()
+    })
+  })
 }
 
 function installContentSecurityPolicy(): void {

@@ -31,7 +31,7 @@ window.overlay-window {
 
 .chat-panel.panel-expanded .transcript-scroll {
   margin-left: 8px;
-  margin-right: 8px;
+  margin-right: 0;
 }
 
 .theme-light .chat-panel {
