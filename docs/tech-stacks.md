@@ -25,11 +25,13 @@ The renderer is sandboxed, uses context isolation, has no Node integration, and 
 | `chathead-linux` | `crates/chathead-linux` | Newline-delimited IPC sidecar and GTK/Wayland overlay. |
 | GTK 4 + Cairo | `overlay.rs` | Native chat panel, composer, animated orb, input controllers, and rendering. |
 | `gtk4-layer-shell` | `chathead-linux` | Creates a click-through `wlr-layer-shell` overlay on supported Wayland compositors. |
+| GNOME Shell 46 ES modules + `St`/`Clutter` | `gnome-extension/` | Creates compositor-owned orb/panel actors on Ubuntu 24.04 GNOME Wayland without XWayland or window-list manipulation. |
+| GDBus presentation protocol 1 | `presentation.rs` | Publishes revisioned renderer-neutral snapshots and typed actions while keeping parsing, links, copy payloads, providers, and voice in Rust. |
 | ashpd GlobalShortcuts | `overlay.rs` | Registers `Super+E` for voice and `Super+W` for panel visibility through the XDG portal, consuming Activated and Deactivated events. |
 | Tokio + `futures-util` | shortcut thread | Runs portal registration and both event streams away from GTK. |
 | Linux Secret Service via `keyring` | `chathead-core` | Stores provider API keys without putting secrets in IPC or plaintext configuration. |
 
-The overlay targets Linux x86_64 and Wayland compositors with `wlr-layer-shell`, initially Hyprland. GNOME can run Settings but does not support this overlay surface. There is no XWayland or compositor-polling fallback.
+The overlay targets Linux x86_64 Wayland. Hyprland/wlroots uses the existing GTK layer surface; GNOME Shell 46 uses the bundled Shell extension. Unsupported compositors and GNOME Xorg retain Settings but cannot launch. There is no XWayland or compositor-polling fallback.
 
 ## Local Voice
 
@@ -57,6 +59,7 @@ Voice is disabled by default. Raw audio is held only in bounded memory, never wr
 | Cargo wrapper | `scripts/cargo-native.sh` | Supplies local native build/link paths. Use this instead of plain Cargo for project checks and builds. |
 | electron-builder | `package.json` | Produces Linux x86_64 AppImage and Debian packages. Debian declares the linked ALSA and PipeWire runtime dependencies; CPAL's PulseAudio backend speaks the server protocol without linking `libpulse`. |
 | `ldd` packaging gate | `scripts/check-sidecar-links.sh` | Rejects a release sidecar with unresolved links or missing CPAL audio backends. |
+| `gnome-extensions pack` gate | `scripts/check-gnome-extension.sh` | Validates GNOME metadata and produces the same extension archive format used by the guided installer. |
 | Vitest, rustfmt, Clippy, Rust tests | `pnpm check` | Verifies TypeScript, IPC-facing UI behavior, Rust state/DSP/integrity behavior, formatting, and warning-free code. |
 
 ## Provider transport status

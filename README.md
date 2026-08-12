@@ -1,21 +1,23 @@
 # ChatHead AI
 
-ChatHead AI uses an Electron/React settings application and a Rust/GTK4
-layer-shell sidecar. Electron owns the tray, setup window, and sidecar
-lifecycle; Rust owns credentials, provider readiness, Codex authentication,
-the Wayland overlay, drag/input regions, panel, and global shortcut.
+ChatHead AI uses an Electron/React settings application and a Rust sidecar with
+two Wayland presentation backends. Electron owns the tray, setup window, and
+sidecar lifecycle; Rust owns credentials, provider readiness, conversations,
+voice, safe Markdown projections, links, clipboard content, and commands.
 
 ## Supported platform
 
 - Linux x86_64
-- Wayland compositor with `wlr-layer-shell` for the overlay (initially Hyprland)
-- Ubuntu 22.04-compatible build environment
+- Hyprland/wlroots through GTK4 `wlr-layer-shell`, or Ubuntu 24.04 GNOME Shell
+  46 Wayland through the bundled Shell extension
+- Ubuntu 24.04-compatible build environment
 - GTK 4.6 or newer and an XDG portal with GlobalShortcuts support
 - Rust 1.92 or newer, Node.js, and pnpm 11
 
-GNOME does not implement `wlr-layer-shell`; settings can open there, but the
-native overlay reports `LAYER_SHELL_UNSUPPORTED` rather than silently falling
-back to XWayland.
+GNOME does not implement `wlr-layer-shell`. On GNOME 46, Settings offers an
+explicit current-user installation of the bundled ES-module extension, which
+renders Shell-native `St`/`Clutter` actors. Other GNOME versions and Xorg keep
+Settings usable but disable overlay launch. There is no XWayland fallback.
 
 ## Clone the repository
 
@@ -69,7 +71,8 @@ pnpm dist:linux
 
 The first command builds the release sidecar and production Electron bundles.
 The second creates x86_64 AppImage and Debian artifacts. The package includes
-the Rust sidecar and the locally bootstrapped `gtk4-layer-shell` runtime. Debian
+the Rust sidecar, bundled GNOME 46 extension source, and locally bootstrapped
+`gtk4-layer-shell` runtime. Debian
 declares ALSA and PipeWire runtime dependencies; CPAL's PulseAudio backend uses
 the server protocol directly, so it does not add a `libpulse` link; packaging also
 runs `ldd` against the release sidecar.
@@ -83,7 +86,7 @@ chathead-ai
 
 ## Security and IPC
 
-The sidecar speaks newline-delimited JSON protocol version 9 over stdin/stdout.
+The sidecar speaks newline-delimited JSON protocol version 11 over stdin/stdout.
 Stdout is reserved for protocol messages; diagnostics use stderr. Snapshots
 contain provider status and overlay state but never credential values.
 
@@ -119,6 +122,18 @@ The overlay remains a monitor-sized GTK layer surface. Its compositor input
 region contains only the orb and open panel at rest, expands for dragging, and
 returns to click-through behavior after release. The panel is kept within the
 output edges.
+
+On GNOME 46 Wayland, the extension owns only the Shell actors for the orb and
+panel. The sidecar exposes independent presentation protocol version 1 over the
+session bus; snapshots contain revisioned, validated UI data and no credentials,
+tokens, raw audio, model files, or Codex identifiers. Revision gaps cause a full
+resync. Losing the extension bus owner stops the logical overlay and launch is
+disabled until integration is available again.
+
+GNOME support remains acceptance-gated: package validation is automated, while
+fullscreen stacking, Overview/lock hiding, mixed scaling, focus, drag, and
+multi-monitor behavior must pass the Ubuntu 24.04 GNOME 46 live matrix before a
+release is advertised as fully supported.
 
 Local Voice is off by default. Settings offers independently downloadable,
 checksum-verified Whisper Tiny multilingual INT8 and Qwen3-ASR 0.6B INT8
