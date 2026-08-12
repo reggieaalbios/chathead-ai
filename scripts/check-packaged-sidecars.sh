@@ -18,6 +18,8 @@ for artifact in "$project_dir"/dist/*.AppImage; do
     "$project_dir/scripts/check-sidecar-links.sh" \
         "$appimage_dir/squashfs-root/resources/sidecar/chathead-linux" \
         "$appimage_dir/squashfs-root/resources/native/lib"
+    test -f "$appimage_dir/squashfs-root/resources/gnome-extension/chathead-ai@io.github.chathead-ai/metadata.json"
+    test -f "$appimage_dir/squashfs-root/resources/gnome-extension/chathead-ai@io.github.chathead-ai/extension.js"
 done
 
 for artifact in "$project_dir"/dist/*.deb; do
@@ -37,6 +39,11 @@ for artifact in "$project_dir"/dist/*.deb; do
         exit 1
     fi
     "$project_dir/scripts/check-sidecar-links.sh" "$sidecar" "$native_lib"
+    extension_dir=$(find "$deb_dir" -path '*/resources/gnome-extension/chathead-ai@io.github.chathead-ai' -type d -print -quit)
+    if [ -z "$extension_dir" ] || [ ! -f "$extension_dir/metadata.json" ] || [ ! -f "$extension_dir/extension.js" ]; then
+        printf '%s\n' "Packaged Debian GNOME extension is missing" >&2
+        exit 1
+    fi
 done
 
 if [ "$found" = false ]; then

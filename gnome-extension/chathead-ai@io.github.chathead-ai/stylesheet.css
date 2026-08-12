@@ -1,0 +1,17 @@
+#chathead-root { background-color: transparent; }
+.chathead-orb { width: 84px; height: 84px; padding: 0; border: 0; border-radius: 42px; background-color: transparent; box-shadow: none; }
+.chathead-orb:hover, .chathead-orb:focus { background-color: rgba(98, 126, 255, .10); }
+.chathead-panel { width: 560px; height: 460px; padding: 14px; spacing: 12px; border: 1px solid rgba(96,139,184,.55); border-radius: 18px; color: #18324d; background-color: rgba(245,250,255,.98); box-shadow: 0 20px 55px rgba(0,0,0,.36); }
+.chathead-header, .chathead-composer, .chathead-actions, .chathead-link-confirmation { spacing: 8px; }
+.chathead-header { font-weight: bold; }
+.chathead-transcript { vfade-offset: 24px; }
+.chathead-message { padding: 8px; spacing: 5px; border-radius: 10px; }
+.chathead-message.user { background-color: rgba(44,132,207,.14); }
+.chathead-message.assistant { background-color: rgba(255,255,255,.72); }
+.chathead-heading { font-weight: bold; font-size: 15px; }
+.chathead-code { padding: 8px; font-family: monospace; background-color: #14243a; color: #e5eef9; border-radius: 7px; }
+.chathead-table { border: 1px solid rgba(80,110,140,.35); }
+.chathead-table-cell { padding: 4px 7px; }
+.chathead-error { color: #b32645; }
+.chathead-separator { height: 1px; background-color: rgba(70,100,130,.35); }
+.chathead-composer StEntry { min-height: 38px; }

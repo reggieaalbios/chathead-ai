@@ -16,11 +16,12 @@
     "dev": "./scripts/cargo-native.sh build -p chathead-linux && electron-vite dev",
     "start": "electron-vite preview",
     "typecheck": "tsc --noEmit",
-    "lint": "eslint electron.vite.config.ts vitest.config.ts src/main src/preload src/renderer src/shared",
+    "lint": "eslint electron.vite.config.ts vitest.config.ts src/main src/preload src/renderer src/shared gnome-extension/**/*.js",
     "test": "vitest run",
-    "check": "pnpm typecheck && pnpm lint && pnpm test && cargo fmt --all --check && ./scripts/cargo-native.sh clippy --workspace --all-targets -- -D warnings && ./scripts/cargo-native.sh test --workspace",
+    "check": "pnpm typecheck && pnpm lint && pnpm test && pnpm check:gnome-extension && cargo fmt --all --check && ./scripts/cargo-native.sh clippy --workspace --all-targets -- -D warnings && ./scripts/cargo-native.sh test --workspace",
     "build": "./scripts/cargo-native.sh build -p chathead-linux --release && electron-vite build",
     "check:sidecar-links": "./scripts/check-sidecar-links.sh target/release/chathead-linux .local-native/lib",
+    "check:gnome-extension": "./scripts/check-gnome-extension.sh",
     "check:packaged-sidecars": "./scripts/check-packaged-sidecars.sh",
     "benchmark:voice": "./scripts/cargo-native.sh run -p chathead-voice --bin voice-benchmark --",
     "dist:linux": "pnpm build && pnpm check:sidecar-links && electron-builder --linux AppImage deb --x64 && pnpm check:packaged-sidecars",
@@ -62,6 +63,7 @@
     "files": ["out/**/*", "package.json"],
     "extraResources": [
       { "from": "target/release/chathead-linux", "to": "sidecar/chathead-linux" },
+      { "from": "gnome-extension/chathead-ai@io.github.chathead-ai", "to": "gnome-extension/chathead-ai@io.github.chathead-ai" },
       { "from": ".local-native/lib", "to": "native/lib", "filter": ["libgtk4-layer-shell.so*"] },
       { "from": "src/assets/provider/dark/image-Photoroom (7).png", "to": "provider-icon.png" }
     ],

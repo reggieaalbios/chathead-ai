@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="84" height="84" viewBox="0 0 84 84">
+  <defs>
+    <radialGradient id="glow" cx="50%" cy="48%" r="50%">
+      <stop offset="0" stop-color="#6f8cff" stop-opacity=".26"/>
+      <stop offset=".58" stop-color="#6f8cff" stop-opacity=".12"/>
+      <stop offset="1" stop-color="#6f8cff" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="orb-shell" cx="35%" cy="28%" r="76%">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset=".48" stop-color="#f5f9ff"/>
+      <stop offset=".82" stop-color="#dce8ff"/>
+      <stop offset="1" stop-color="#b8cdf2"/>
+    </radialGradient>
+    <linearGradient id="face-plate" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#5f85ff"/>
+      <stop offset=".55" stop-color="#405ff7"/>
+      <stop offset="1" stop-color="#3978ff"/>
+    </linearGradient>
+    <filter id="shadow" x="-40%" y="-40%" width="180%" height="200%">
+      <feDropShadow dx="0" dy="5" stdDeviation="5" flood-color="#183572" flood-opacity=".30"/>
+    </filter>
+  </defs>
+  <circle cx="42" cy="42" r="40" fill="url(#glow)"/>
+  <circle cx="42" cy="42" r="28.5" fill="url(#orb-shell)" stroke="#d5e4ff" stroke-width="1.2" filter="url(#shadow)"/>
+  <path d="M29 30.5a20 20 0 0 1 25-7" fill="none" stroke="#ffffff" stroke-opacity=".80" stroke-width="1.4" stroke-linecap="round"/>
+  <rect x="27" y="31.5" width="30" height="21" rx="10.5" fill="url(#face-plate)"/>
+  <rect x="32.8" y="35.7" width="18.4" height="12.6" rx="6.3" fill="#fbfdff"/>
+  <circle cx="38.5" cy="42" r="2.15" fill="#5272ff"/>
+  <circle cx="45.5" cy="42" r="2.15" fill="#5272ff"/>
+</svg>

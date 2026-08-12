@@ -1,0 +1,7 @@
+{
+  "uuid": "chathead-ai@io.github.chathead-ai",
+  "name": "ChatHead AI",
+  "description": "GNOME Shell presentation backend for the local ChatHead AI sidecar.",
+  "shell-version": ["46"],
+  "url": "https://github.com/ReggieAlbiosA/chathead-ai"
+}
