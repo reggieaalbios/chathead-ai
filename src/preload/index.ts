@@ -1,5 +1,5 @@
 import { contextBridge, ipcRenderer } from 'electron'
-import type { BackendApi, BackendSnapshot, PanelPosition, PanelSize, PanelZoom, ProviderId, ResolvedAppearance, VoiceInteractionMode, VoiceModelId, VoiceSubmissionMode } from '../shared/backend'
+import type { BackendApi, BackendSnapshot, PanelPosition, PanelSize, PanelZoom, ProviderId, ResolvedAppearance, ShortcutAction, VoiceInteractionMode, VoiceModelId, VoiceSubmissionMode } from '../shared/backend'
 
 const backend: BackendApi = Object.freeze({
   getSnapshot: () => ipcRenderer.invoke('backend:getSnapshot'),
@@ -26,6 +26,11 @@ const backend: BackendApi = Object.freeze({
   removeVoiceModel: (modelId: VoiceModelId) => ipcRenderer.invoke('backend:removeVoiceModel', modelId),
   startVoiceTest: () => ipcRenderer.invoke('backend:startVoiceTest'),
   stopVoiceTest: () => ipcRenderer.invoke('backend:stopVoiceTest'),
+  beginShortcutCapture: (action: ShortcutAction) => ipcRenderer.invoke('backend:beginShortcutCapture', action),
+  cancelShortcutCapture: (action: ShortcutAction) => ipcRenderer.invoke('backend:cancelShortcutCapture', action),
+  confirmShortcutReplacement: (action: ShortcutAction) => ipcRenderer.invoke('backend:confirmShortcutReplacement', action),
+  clearShortcut: (action: ShortcutAction) => ipcRenderer.invoke('backend:clearShortcut', action),
+  repairShortcutIntegration: () => ipcRenderer.invoke('backend:repairShortcutIntegration'),
   shutdown: () => ipcRenderer.invoke('backend:shutdown'),
   onSnapshotChanged: (callback: (snapshot: BackendSnapshot) => void) => {
     const listener = (_event: Electron.IpcRendererEvent, snapshot: BackendSnapshot): void => callback(snapshot)

@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { Activity, Check, ChevronDown, Home, Keyboard, LoaderCircle, Minus, Settings, X } from 'lucide-react'
 import { z } from 'zod'
-import type { BackendSnapshot, ProviderId, ProviderSnapshot, VoiceInteractionMode, VoiceModelId, VoiceSubmissionMode } from '../../shared/backend'
+import type { BackendSnapshot, ProviderId, ProviderSnapshot, ShortcutAction, ShortcutState, VoiceInteractionMode, VoiceModelId, VoiceSubmissionMode } from '../../shared/backend'
 import type { PanelPosition } from '../../shared/backend'
 import type { Appearance } from './store'
 import { useUiStore } from './store'
@@ -124,7 +124,7 @@ export function App(): React.JSX.Element {
           </section>
         </> : view === 'settings'
           ? <SettingsView snapshot={snapshot} appearance={appearance} panelPosition={panelPosition} onError={setUnavailable} onAppearanceChange={setAppearance} onPanelPositionChange={setPanelPosition} />
-          : <KeyboardShortcutsView snapshot={snapshot} />}
+          : <KeyboardShortcutsView snapshot={snapshot} onSnapshot={setSnapshot} onError={setUnavailable} />}
       </section>
 
       {selected && <ProviderModal provider={selected} theme={resolvedAppearance} onClose={() => selectProvider(undefined)} onSnapshot={setSnapshot} />}
@@ -132,10 +132,18 @@ export function App(): React.JSX.Element {
   )
 }
 
-function KeyboardShortcutsView({ snapshot }: { snapshot?: BackendSnapshot }): React.JSX.Element {
-  const voiceStatus = describeGlobalShortcut(snapshot?.shortcutStatus, 'Super+E')
-  const panelStatus = describeGlobalShortcut(snapshot?.panelShortcutStatus, 'Super+W')
+function KeyboardShortcutsView({ snapshot, onSnapshot, onError }: {
+  snapshot?: BackendSnapshot
+  onSnapshot(snapshot: BackendSnapshot): void
+  onError(message: string): void
+}): React.JSX.Element {
   const interactionMode = snapshot?.voice.interactionMode === 'toggle' ? 'Toggle' : 'Hold to talk'
+  const integration = snapshot?.shortcutIntegration
+
+  async function act(request: () => Promise<BackendSnapshot>): Promise<void> {
+    try { onSnapshot(await request()) }
+    catch (error) { onError(error instanceof Error ? error.message : String(error)) }
+  }
 
   return (
     <section className="shortcuts-view" aria-labelledby="shortcuts-title">
@@ -150,23 +158,65 @@ function KeyboardShortcutsView({ snapshot }: { snapshot?: BackendSnapshot }): Re
         { action: 'Insert newline', keys: 'Shift + Enter', scope: 'Panel-local' },
         { action: 'Cancel voice', keys: 'Escape', scope: 'Panel-local' }
       ]} />
-      <ShortcutGroup title="Global hotkeys" entries={[
-        { action: 'Voice shortcut', keys: 'Preferred: Super+E', scope: 'System-wide', status: `${voiceStatus.label} · ${voiceStatus.detail}` },
-        { action: 'Toggle chat panel', keys: 'Preferred: Super+W', scope: 'System-wide', status: `${panelStatus.label} · ${panelStatus.detail}` },
-        { action: 'Interaction mode', keys: interactionMode, scope: 'System-wide' }
-      ]} />
+      <section className="shortcut-group" aria-labelledby="global-hotkeys-title">
+        <h2 id="global-hotkeys-title">Global hotkeys</h2>
+        <div className="shortcut-list">
+          <GlobalShortcutRow label="Toggle chat panel" action="togglePanel" state={snapshot?.shortcutActions.togglePanel} pressedKeys={snapshot?.shortcutCapture?.action === 'togglePanel' ? snapshot.shortcutCapture.pressedKeys : []} act={act} />
+          <GlobalShortcutRow label="Voice input" action="voiceInput" state={snapshot?.shortcutActions.voiceInput} pressedKeys={snapshot?.shortcutCapture?.action === 'voiceInput' ? snapshot.shortcutCapture.pressedKeys : []} act={act} />
+          <div className="shortcut-row"><div><strong>Interaction mode</strong><small>Controls whether voice responds to press/release or toggles on activation.</small></div><div className="shortcut-binding"><kbd>{interactionMode}</kbd><span>System-wide</span></div></div>
+        </div>
+      </section>
+      <div className="shortcut-integration" role="status">
+        <strong>Detected integration</strong>
+        <span>{integration?.supported
+          ? `Hyprland ${integration.hyprlandVersion ?? 'unknown'} · ${integration.configFormat === 'lua' ? 'Lua' : 'Legacy hyprlang'} · ${integration.backend === 'hyprlandPortal' ? 'Portal' : 'Native event'}`
+          : integration?.message ?? 'Detecting the active desktop session…'}</span>
+        {integration && <button onClick={() => void act(() => window.chathead.backend.repairShortcutIntegration())}>Repair integration</button>}
+      </div>
+      <p className="shortcut-note">No shortcut is reserved until you configure one. ChatHead must be running for these shortcuts to activate. Root access is never required.</p>
     </section>
   )
 }
 
-function describeGlobalShortcut(shortcut: BackendSnapshot['shortcutStatus'] | undefined, preferred: string): { label: string; detail: string } {
-  return !shortcut || shortcut.state === 'registering'
-    ? { label: 'Registering', detail: `Waiting for the desktop portal. Preferred shortcut: ${preferred}.` }
-    : shortcut.state === 'ready'
-      ? { label: 'Ready', detail: `Current shortcut: ${shortcut.trigger}` }
-      : shortcut.state === 'conflictPossible'
-        ? { label: 'Conflict warning', detail: shortcut.details }
-        : { label: 'Unavailable', detail: shortcut.details }
+function GlobalShortcutRow({ label, action, state, pressedKeys, act }: {
+  label: string
+  action: ShortcutAction
+  state?: ShortcutState
+  pressedKeys: string[]
+  act(request: () => Promise<BackendSnapshot>): Promise<void>
+}): React.JSX.Element {
+  const current = state?.state === 'ready' ? state.binding.display
+    : state?.state === 'capturing' ? `Listening…${pressedKeys.length ? ` ${pressedKeys.join(' + ')}` : ''}`
+      : state?.state === 'applying' ? `Applying ${state.candidate.display}…`
+        : state?.state === 'conflict' ? state.candidate.display
+          : 'Not configured'
+  const description = state?.state === 'conflict'
+    ? `${state.conflicts.length} conflict${state.conflicts.length === 1 ? '' : 's'} require confirmation.`
+    : state?.state === 'error' ? state.message
+      : state?.state === 'capturing' ? 'Press the full shortcut in the native capture window and release every key.'
+        : state?.state === 'ready' ? `Active through ${state.backend === 'hyprlandPortal' ? 'the Global Shortcuts portal' : 'Hyprland native events'}.`
+          : 'No system-wide key is reserved.'
+  const disabled = state?.state === 'capturing' || state?.state === 'applying'
+  return <>
+    <div className="shortcut-row">
+      <div><strong>{label}</strong><small>{description}</small></div>
+      <div className="shortcut-binding shortcut-actions">
+        <kbd>{current}</kbd>
+        <button disabled={disabled} onClick={() => void act(() => window.chathead.backend.beginShortcutCapture(action))}>Edit</button>
+        {(state?.state === 'ready' || state?.state === 'error') && <button onClick={() => {
+          if (window.confirm(`Clear the ${label} shortcut? Any original Hyprland binding will become active again.`)) void act(() => window.chathead.backend.clearShortcut(action))
+        }}>Clear</button>}
+      </div>
+    </div>
+    {state?.state === 'conflict' && <div className="shortcut-conflict" role="dialog" aria-label={`${label} shortcut conflict`}>
+      <strong>{state.conflicts.some((conflict) => conflict.dispatcher === 'high-risk confirmation') ? 'Confirm system-wide single key' : 'Replace existing shortcut?'}</strong>
+      <p>{state.conflicts.some((conflict) => conflict.dispatcher === 'high-risk confirmation')
+        ? 'An unmodified key can intercept normal typing in every application.'
+        : 'ChatHead will shadow these Hyprland bindings without modifying their original lines:'}</p>
+      <ul>{state.conflicts.map((conflict, index) => <li key={`${conflict.dispatcher}-${index}`}><b>{conflict.description}</b> · {conflict.dispatcher}{conflict.argument && ` · ${conflict.argument}`}{conflict.submap && ` · submap ${conflict.submap}`}</li>)}</ul>
+      <div><button onClick={() => void act(() => window.chathead.backend.confirmShortcutReplacement(action))}>{state.conflicts.some((conflict) => conflict.dispatcher === 'high-risk confirmation') ? 'Use single key' : 'Replace existing shortcut'}</button><button onClick={() => void act(() => window.chathead.backend.cancelShortcutCapture(action))}>Cancel</button></div>
+    </div>}
+  </>
 }
 
 interface ShortcutEntry { action: string; keys: string; scope: 'Panel-local' | 'System-wide'; status?: string }

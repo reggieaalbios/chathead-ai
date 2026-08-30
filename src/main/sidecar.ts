@@ -3,7 +3,7 @@ import { createInterface } from 'node:readline'
 import { join } from 'node:path'
 import { app } from 'electron'
 import { z } from 'zod'
-import { PROTOCOL_VERSION, backendSnapshotSchema, defaultPanelSize, panelSizeSchema, panelZoomSchema, type BackendSnapshot, type PanelPosition, type PanelSize, type PanelZoom, type ProviderId, type ResolvedAppearance, type VoiceInteractionMode, type VoiceModelId, type VoiceSubmissionMode } from '../shared/backend'
+import { PROTOCOL_VERSION, backendSnapshotSchema, defaultPanelSize, panelSizeSchema, panelZoomSchema, type BackendSnapshot, type PanelPosition, type PanelSize, type PanelZoom, type ProviderId, type ResolvedAppearance, type ShortcutAction, type VoiceInteractionMode, type VoiceModelId, type VoiceSubmissionMode } from '../shared/backend'
 
 const ipcErrorSchema = z.object({ code: z.string(), message: z.string(), recoverable: z.boolean() })
 const messageSchema = z.object({ protocolVersion: z.number() }).passthrough()
@@ -127,6 +127,11 @@ export class SidecarManager {
   removeVoiceModel = (modelId: VoiceModelId): Promise<BackendSnapshot> => this.request('removeVoiceModel', { modelId })
   startVoiceTest = (): Promise<BackendSnapshot> => this.request('startVoiceTest')
   stopVoiceTest = (): Promise<BackendSnapshot> => this.request('stopVoiceTest')
+  beginShortcutCapture = (action: ShortcutAction): Promise<BackendSnapshot> => this.request('beginShortcutCapture', { action })
+  cancelShortcutCapture = (action: ShortcutAction): Promise<BackendSnapshot> => this.request('cancelShortcutCapture', { action })
+  confirmShortcutReplacement = (action: ShortcutAction): Promise<BackendSnapshot> => this.request('confirmShortcutReplacement', { action })
+  clearShortcut = (action: ShortcutAction): Promise<BackendSnapshot> => this.request('clearShortcut', { action })
+  repairShortcutIntegration = (): Promise<BackendSnapshot> => this.request('repairShortcutIntegration')
 
   async shutdown(): Promise<void> {
     this.intentionallyStopping = true

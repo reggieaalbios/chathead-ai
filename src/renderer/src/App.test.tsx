@@ -19,8 +19,8 @@ const zepOnlySnapshot: BackendSnapshot = {
     ],
     microphoneTestActive: false, message: 'Local voice is off.', recoverable: true
   },
-  shortcutStatus: { state: 'registering' },
-  panelShortcutStatus: { state: 'registering' },
+  shortcutActions: { togglePanel: { state: 'unconfigured' }, voiceInput: { state: 'unconfigured' } },
+  shortcutIntegration: { supported: true, hyprlandVersion: '0.54.3', configFormat: 'legacyHyprlang', backend: 'hyprlandEvent' },
   experimentalChat: { providerId: 'chatgpt', experimental: true, state: 'unavailable', message: 'Connect a ChatGPT subscription.' }
 }
 
@@ -29,7 +29,7 @@ const saveApiKey = vi.fn(async () => ({ ...zepOnlySnapshot, launchReadiness: { r
 const setPanelPosition = vi.fn(async () => zepOnlySnapshot)
 const setPanelZoom = vi.fn(async () => zepOnlySnapshot)
 const setPanelSize = vi.fn(async () => zepOnlySnapshot)
-let panelZoomChanged: ((zoom: 80 | 90 | 100 | 110 | 125 | 150) => void) | undefined
+let panelZoomChanged: ((zoom: 80 | 90 | 100 | 110 | 125 | 150 | 175 | 200 | 225 | 250) => void) | undefined
 let panelSizeChanged: ((size: PanelSize) => void) | undefined
 
 beforeEach(() => {
@@ -48,6 +48,9 @@ beforeEach(() => {
       retryVoiceSetup: vi.fn(async () => zepOnlySnapshot), setVoiceModel: vi.fn(async () => zepOnlySnapshot),
       downloadVoiceModel: vi.fn(async () => zepOnlySnapshot), cancelVoiceModelDownload: vi.fn(async () => zepOnlySnapshot), removeVoiceModel: vi.fn(async () => zepOnlySnapshot),
       startVoiceTest: vi.fn(async () => zepOnlySnapshot), stopVoiceTest: vi.fn(async () => zepOnlySnapshot),
+      beginShortcutCapture: vi.fn(async () => zepOnlySnapshot), cancelShortcutCapture: vi.fn(async () => zepOnlySnapshot),
+      confirmShortcutReplacement: vi.fn(async () => zepOnlySnapshot), clearShortcut: vi.fn(async () => zepOnlySnapshot),
+      repairShortcutIntegration: vi.fn(async () => zepOnlySnapshot),
       shutdown: vi.fn(), onSnapshotChanged: () => () => undefined, onVoiceLevelChanged: () => () => undefined,
       onPanelZoomChanged: (callback) => { panelZoomChanged = callback; return () => { panelZoomChanged = undefined } },
       onPanelSizeChanged: (callback) => { panelSizeChanged = callback; return () => { panelSizeChanged = undefined } }
@@ -215,7 +218,7 @@ describe('setup application', () => {
     expect(useUiStore.getState().panelSize).toEqual({ width: 560, height: 460 })
   })
 
-  it('documents local and global shortcut groups without remapping controls', async () => {
+  it('starts with both global shortcuts unconfigured and exposes edit controls', async () => {
     render(<App />)
     fireEvent.click(screen.getByRole('button', { name: 'Keyboard Shortcuts' }))
 
@@ -223,32 +226,37 @@ describe('setup application', () => {
     expect(screen.getByRole('heading', { name: 'Chat' })).toBeInTheDocument()
     expect(screen.getByRole('heading', { name: 'Global hotkeys' })).toBeInTheDocument()
     expect(screen.getAllByText('Panel-local')).toHaveLength(6)
-    expect(screen.getAllByText('System-wide')).toHaveLength(3)
-    expect(screen.getAllByText(/Registering · Waiting for the desktop portal/)).toHaveLength(2)
-    expect(screen.queryByRole('combobox', { name: /shortcut/i })).not.toBeInTheDocument()
+    expect(screen.getAllByText('Not configured')).toHaveLength(2)
+    expect(screen.getAllByRole('button', { name: 'Edit' })).toHaveLength(2)
+    expect(screen.getByText(/No shortcut is reserved until you configure one/)).toBeInTheDocument()
   })
 
-  it.each([
-    [{ state: 'ready' as const, trigger: 'Super+E' }, /Ready · Current shortcut: Super\+E/],
-    [{ state: 'conflictPossible' as const, details: 'Already reserved.' }, /Conflict warning · Already reserved/],
-    [{ state: 'unavailable' as const, details: 'Portal missing.' }, /Unavailable · Portal missing/]
-  ])('renders the global shortcut status variant', async (shortcutStatus, expected) => {
-    getSnapshot.mockResolvedValueOnce({ ...zepOnlySnapshot, shortcutStatus })
+  it('renders configured action state and detected legacy integration independently', async () => {
+    getSnapshot.mockResolvedValueOnce({ ...zepOnlySnapshot, shortcutActions: {
+      togglePanel: { state: 'unconfigured' },
+      voiceInput: { state: 'ready', binding: { modifiers: ['SUPER'], key: 'E', display: 'Super + E' }, backend: 'hyprlandEvent' }
+    } })
     render(<App />)
     fireEvent.click(screen.getByRole('button', { name: 'Keyboard Shortcuts' }))
-    expect(await screen.findByText(expected)).toBeInTheDocument()
+    expect(await screen.findByText('Super + E')).toBeInTheDocument()
+    expect(screen.getByText(/Hyprland 0.54.3 · Legacy hyprlang · Native event/)).toBeInTheDocument()
   })
 
-  it('reports panel shortcut status independently from voice', async () => {
+  it('lists every displaced Hyprland action before replacement', async () => {
     getSnapshot.mockResolvedValueOnce({
       ...zepOnlySnapshot,
-      shortcutStatus: { state: 'ready', trigger: 'Super+E' },
-      panelShortcutStatus: { state: 'conflictPossible', details: 'Super+W is reserved.' }
+      shortcutActions: {
+        voiceInput: { state: 'unconfigured' },
+        togglePanel: { state: 'conflict', candidate: { modifiers: ['SUPER'], key: 'W', display: 'Super + W' }, conflicts: [
+          { description: 'Wallpaper', dispatcher: 'exec', argument: 'wallpaper.sh', submap: '' }
+        ] }
+      }
     })
     render(<App />)
     fireEvent.click(screen.getByRole('button', { name: 'Keyboard Shortcuts' }))
-    expect(await screen.findByText(/Ready · Current shortcut: Super\+E/)).toBeInTheDocument()
-    expect(screen.getByText(/Conflict warning · Super\+W is reserved/)).toBeInTheDocument()
+    expect(await screen.findByRole('dialog', { name: 'Toggle chat panel shortcut conflict' })).toBeInTheDocument()
+    expect(screen.getByText(/Wallpaper/)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Replace existing shortcut' })).toBeInTheDocument()
   })
 
   it('shows voice transcription without secondary setting descriptions', async () => {

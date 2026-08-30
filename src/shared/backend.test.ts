@@ -2,14 +2,17 @@ import { describe, expect, it } from 'vitest'
 import { PROTOCOL_VERSION, backendSnapshotSchema, panelSizeSchema, panelZoomSchema } from './backend'
 
 describe('desktop protocol', () => {
-  it('uses version 11 for combined launch readiness and bounded panel settings', () => {
-    expect(PROTOCOL_VERSION).toBe(11)
+  it('uses version 12 for user-owned shortcut actions and bounded panel settings', () => {
+    expect(PROTOCOL_VERSION).toBe(12)
     expect(panelZoomSchema.safeParse(125).success).toBe(true)
+    expect(panelZoomSchema.safeParse(250).success).toBe(true)
+    expect(panelZoomSchema.safeParse(251).success).toBe(false)
     expect(panelZoomSchema.safeParse(95).success).toBe(false)
     expect(panelSizeSchema.safeParse({ width: 420, height: 460 }).success).toBe(true)
-    expect(panelSizeSchema.safeParse({ width: 960, height: 800 }).success).toBe(true)
+    expect(panelSizeSchema.safeParse({ width: 1600, height: 850 }).success).toBe(true)
     expect(panelSizeSchema.safeParse({ width: 419, height: 460 }).success).toBe(false)
-    expect(panelSizeSchema.safeParse({ width: 560, height: 801 }).success).toBe(false)
+    expect(panelSizeSchema.safeParse({ width: 1601, height: 460 }).success).toBe(false)
+    expect(panelSizeSchema.safeParse({ width: 560, height: 851 }).success).toBe(false)
   })
 
   it('accepts the Rust camel-case local voice snapshot shape', () => {
@@ -23,8 +26,8 @@ describe('desktop protocol', () => {
           { id: 'sherpa-onnx-qwen3-asr-0.6b-int8-2026-03-25', name: 'Qwen', badges: [], description: 'Large', languages: ['Filipino'], license: 'Apache-2.0', downloadSizeBytes: 2, installedSizeBytes: 2, resourceGuidance: 'High', state: 'notInstalled', downloadProgressPercent: 0, installedSizeBytesActual: 0 }
         ], microphoneTestActive: false, recoverable: true
       },
-      shortcutStatus: { state: 'registering' },
-      panelShortcutStatus: { state: 'registering' },
+      shortcutActions: { togglePanel: { state: 'unconfigured' }, voiceInput: { state: 'unconfigured' } },
+      shortcutIntegration: { supported: true, hyprlandVersion: '0.55.0', configFormat: 'lua', backend: 'hyprlandPortal' },
       experimentalChat: { providerId: 'chatgpt', experimental: true, state: 'unavailable' }
     }).success).toBe(true)
   })
@@ -40,8 +43,8 @@ describe('desktop protocol', () => {
           { id: 'sherpa-onnx-qwen3-asr-0.6b-int8-2026-03-25', name: 'Qwen', badges: [], description: 'Large', languages: [], license: 'Apache', downloadSizeBytes: 2, installedSizeBytes: 2, resourceGuidance: 'High', state: 'notInstalled', downloadProgressPercent: 0, installedSizeBytesActual: 0 }
         ], microphoneTestActive: false, recoverable: true
       },
-      shortcutStatus: { state: 'registering' },
-      panelShortcutStatus: { state: 'registering' },
+      shortcutActions: { togglePanel: { state: 'unconfigured' }, voiceInput: { state: 'unconfigured' } },
+      shortcutIntegration: { supported: false },
       experimentalChat: { providerId: 'chatgpt', experimental: true, state: 'unavailable' }
     }).success).toBe(false)
   })

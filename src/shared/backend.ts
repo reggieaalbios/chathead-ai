@@ -1,12 +1,12 @@
 import { z } from 'zod'
 
-export const PROTOCOL_VERSION = 11 as const
+export const PROTOCOL_VERSION = 12 as const
 
 export const providerIds = ['chatgpt', 'claude', 'gemini', 'grok', 'zep'] as const
 export type ProviderId = (typeof providerIds)[number]
 export type ResolvedAppearance = 'light' | 'dark'
 export type PanelPosition = 'left' | 'right'
-export const panelZoomLevels = [80, 90, 100, 110, 125, 150] as const
+export const panelZoomLevels = [80, 90, 100, 110, 125, 150, 175, 200, 225, 250] as const
 export type PanelZoom = (typeof panelZoomLevels)[number]
 export interface PanelSize { width: number; height: number }
 export const defaultPanelSize: PanelSize = { width: 560, height: 460 }
@@ -97,20 +97,34 @@ export interface BackendSnapshot {
   }
   overlayRunning: boolean
   voice: VoiceSnapshot
-  shortcutStatus:
-    | { state: 'registering' }
-    | { state: 'ready'; trigger: string }
-    | { state: 'conflictPossible' | 'unavailable'; details: string }
-  panelShortcutStatus:
-    | { state: 'registering' }
-    | { state: 'ready'; trigger: string }
-    | { state: 'conflictPossible' | 'unavailable'; details: string }
+  shortcutActions: Record<ShortcutAction, ShortcutState>
+  shortcutIntegration: ShortcutIntegration
+  shortcutCapture?: { action: ShortcutAction; pressedKeys: string[] }
   experimentalChat: {
     providerId: 'chatgpt'
     experimental: true
     state: 'probing' | 'authenticating' | 'ready' | 'unavailable' | 'error'
     message?: string
   }
+}
+
+export type ShortcutAction = 'togglePanel' | 'voiceInput'
+export type ShortcutBackend = 'hyprlandPortal' | 'hyprlandEvent'
+export interface ShortcutBinding { modifiers: string[]; key: string; display: string }
+export interface ShortcutConflict { description: string; dispatcher: string; argument: string; submap: string }
+export type ShortcutState =
+  | { state: 'unconfigured' }
+  | { state: 'capturing' }
+  | { state: 'conflict'; candidate: ShortcutBinding; conflicts: ShortcutConflict[] }
+  | { state: 'applying'; candidate: ShortcutBinding }
+  | { state: 'ready'; binding: ShortcutBinding; backend: ShortcutBackend }
+  | { state: 'error'; message: string; recoverable: boolean }
+export interface ShortcutIntegration {
+  supported: boolean
+  hyprlandVersion?: string
+  configFormat?: 'lua' | 'legacyHyprlang'
+  backend?: ShortcutBackend
+  message?: string
 }
 
 export interface BackendApi {
@@ -138,6 +152,11 @@ export interface BackendApi {
   removeVoiceModel(modelId: VoiceModelId): Promise<BackendSnapshot>
   startVoiceTest(): Promise<BackendSnapshot>
   stopVoiceTest(): Promise<BackendSnapshot>
+  beginShortcutCapture(action: ShortcutAction): Promise<BackendSnapshot>
+  cancelShortcutCapture(action: ShortcutAction): Promise<BackendSnapshot>
+  confirmShortcutReplacement(action: ShortcutAction): Promise<BackendSnapshot>
+  clearShortcut(action: ShortcutAction): Promise<BackendSnapshot>
+  repairShortcutIntegration(): Promise<BackendSnapshot>
   shutdown(): Promise<void>
   onSnapshotChanged(callback: (snapshot: BackendSnapshot) => void): () => void
   onVoiceLevelChanged(callback: (level: number) => void): () => void
@@ -146,12 +165,13 @@ export interface BackendApi {
 }
 
 export const panelZoomSchema = z.union([
-  z.literal(80), z.literal(90), z.literal(100), z.literal(110), z.literal(125), z.literal(150)
+  z.literal(80), z.literal(90), z.literal(100), z.literal(110), z.literal(125), z.literal(150),
+  z.literal(175), z.literal(200), z.literal(225), z.literal(250)
 ])
 
 export const panelSizeSchema = z.object({
-  width: z.number().int().min(420).max(960),
-  height: z.number().int().min(460).max(800)
+  width: z.number().int().min(420).max(1600),
+  height: z.number().int().min(460).max(850)
 }).strict()
 
 const providerStatusSchema = z.discriminatedUnion('state', [
@@ -203,20 +223,35 @@ export const backendSnapshotSchema = z.object({
   }),
   overlayRunning: z.boolean(),
   voice: voiceSnapshotSchema,
-  shortcutStatus: z.union([
-    z.object({ state: z.literal('registering') }),
-    z.object({ state: z.literal('ready'), trigger: z.string() }),
-    z.object({ state: z.literal('conflictPossible'), details: z.string() }),
-    z.object({ state: z.literal('unavailable'), details: z.string() })
-  ]),
-  panelShortcutStatus: z.union([
-    z.object({ state: z.literal('registering') }),
-    z.object({ state: z.literal('ready'), trigger: z.string() }),
-    z.object({ state: z.literal('conflictPossible'), details: z.string() }),
-    z.object({ state: z.literal('unavailable'), details: z.string() })
-  ]),
+  shortcutActions: z.object({
+    togglePanel: z.lazy(() => shortcutStateSchema),
+    voiceInput: z.lazy(() => shortcutStateSchema)
+  }),
+  shortcutIntegration: z.object({
+    supported: z.boolean(),
+    hyprlandVersion: z.string().optional(),
+    configFormat: z.enum(['lua', 'legacyHyprlang']).optional(),
+    backend: z.enum(['hyprlandPortal', 'hyprlandEvent']).optional(),
+    message: z.string().optional()
+  }),
+  shortcutCapture: z.object({ action: z.enum(['togglePanel', 'voiceInput']), pressedKeys: z.array(z.string()) }).optional(),
   experimentalChat: z.object({
     providerId: z.literal('chatgpt'), experimental: z.literal(true),
     state: z.enum(['probing', 'authenticating', 'ready', 'unavailable', 'error']), message: z.string().optional()
   })
 })
+
+const shortcutBindingSchema = z.object({
+  modifiers: z.array(z.string()), key: z.string(), display: z.string()
+}).strict()
+const shortcutConflictSchema = z.object({
+  description: z.string(), dispatcher: z.string(), argument: z.string(), submap: z.string()
+}).strict()
+const shortcutStateSchema: z.ZodType<ShortcutState> = z.discriminatedUnion('state', [
+  z.object({ state: z.literal('unconfigured') }),
+  z.object({ state: z.literal('capturing') }),
+  z.object({ state: z.literal('conflict'), candidate: shortcutBindingSchema, conflicts: z.array(shortcutConflictSchema) }),
+  z.object({ state: z.literal('applying'), candidate: shortcutBindingSchema }),
+  z.object({ state: z.literal('ready'), binding: shortcutBindingSchema, backend: z.enum(['hyprlandPortal', 'hyprlandEvent']) }),
+  z.object({ state: z.literal('error'), message: z.string(), recoverable: z.boolean() })
+])

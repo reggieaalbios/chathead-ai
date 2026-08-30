@@ -14,16 +14,13 @@ let latestSnapshot: BackendSnapshot | undefined
 const developmentCspNonce = 'chathead-vite-development'
 
 const sidecar = new SidecarManager(
-  (message) => window?.webContents.send('backend:unavailable', message),
+  (message) => sendToWindow('backend:unavailable', message),
   (_purpose, url) => {
     const approved = approvedCodexLoginUrl(url)
     if (approved) void shell.openExternal(approved)
-    else window?.webContents.send('backend:unavailable', 'Codex returned an unapproved authentication address.')
+    else sendToWindow('backend:unavailable', 'Codex returned an unapproved authentication address.')
   },
-  () => {
-    showWindow()
-    window?.webContents.send('window:showSettings')
-  }
+  showSettings
 )
 const gotLock = app.requestSingleInstanceLock()
 if (!gotLock) app.quit()
@@ -35,14 +32,14 @@ app.whenReady().then(async () => {
   createTray()
   sidecar.onSnapshotChanged((snapshot) => {
     latestSnapshot = snapshot
-    window?.webContents.send('backend:snapshotChanged', snapshot)
+    sendToWindow('backend:snapshotChanged', snapshot)
     refreshTrayMenu()
   })
-  sidecar.onVoiceLevelChanged((level) => window?.webContents.send('backend:voiceLevelChanged', level))
-  sidecar.onPanelZoomChanged((zoom) => window?.webContents.send('backend:panelZoomChanged', zoom))
-  sidecar.onPanelSizeChanged((size) => window?.webContents.send('backend:panelSizeChanged', size))
+  sidecar.onVoiceLevelChanged((level) => sendToWindow('backend:voiceLevelChanged', level))
+  sidecar.onPanelZoomChanged((zoom) => sendToWindow('backend:panelZoomChanged', zoom))
+  sidecar.onPanelSizeChanged((size) => sendToWindow('backend:panelSizeChanged', size))
   registerIpc()
-  try { await sidecar.start() } catch (error) { window?.webContents.send('backend:unavailable', error instanceof Error ? error.message : String(error)) }
+  try { await sidecar.start() } catch (error) { sendToWindow('backend:unavailable', error instanceof Error ? error.message : String(error)) }
 })
 
 app.on('activate', showWindow)
@@ -55,7 +52,10 @@ app.on('before-quit', (event) => {
 app.on('window-all-closed', () => { /* tray process intentionally remains active */ })
 
 function createWindow(): void {
-  window = new BrowserWindow({
+  const existingWindow = activeWindow()
+  if (existingWindow) return
+
+  const createdWindow = new BrowserWindow({
     width: 880, height: 600, minWidth: 880, maxWidth: 880, minHeight: 600, maxHeight: 600,
     // Keep the fixed dimensions aligned with the renderer's 880x600 shell.
     // Without this, the platform window decoration metrics are included in
@@ -66,12 +66,23 @@ function createWindow(): void {
       contextIsolation: true, nodeIntegration: false, sandbox: true, devTools: !app.isPackaged
     }
   })
-  window.on('close', (event) => { if (!quitting) { event.preventDefault(); window?.hide() } })
-  window.once('ready-to-show', () => window?.show())
-  window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
-  window.webContents.on('will-navigate', (event) => event.preventDefault())
-  if (!app.isPackaged && process.env.ELECTRON_RENDERER_URL) void window.loadURL(process.env.ELECTRON_RENDERER_URL)
-  else void window.loadFile(join(__dirname, '../renderer/index.html'))
+  window = createdWindow
+  createdWindow.on('close', (event) => {
+    if (!quitting) {
+      event.preventDefault()
+      createdWindow.hide()
+    }
+  })
+  createdWindow.on('closed', () => {
+    if (window === createdWindow) window = undefined
+  })
+  createdWindow.once('ready-to-show', () => {
+    if (!createdWindow.isDestroyed()) createdWindow.show()
+  })
+  createdWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
+  createdWindow.webContents.on('will-navigate', (event) => event.preventDefault())
+  if (!app.isPackaged && process.env.ELECTRON_RENDERER_URL) void createdWindow.loadURL(process.env.ELECTRON_RENDERER_URL)
+  else void createdWindow.loadFile(join(__dirname, '../renderer/index.html'))
 }
 
 function createTray(): void {
@@ -94,11 +105,38 @@ function refreshTrayMenu(): void {
   ]))
 }
 
-function showWindow(): void {
-  if (!window) return
-  window.show()
-  if (window.isMinimized()) window.restore()
-  window.focus()
+function activeWindow(): BrowserWindow | undefined {
+  if (window?.isDestroyed()) window = undefined
+  return window
+}
+
+function showWindow(): BrowserWindow | undefined {
+  if (quitting || !app.isReady()) return undefined
+  if (!activeWindow()) createWindow()
+  const currentWindow = activeWindow()
+  if (!currentWindow) return undefined
+  currentWindow.show()
+  if (currentWindow.isMinimized()) currentWindow.restore()
+  currentWindow.focus()
+  return currentWindow
+}
+
+function sendToWindow(channel: string, ...arguments_: unknown[]): void {
+  const currentWindow = activeWindow()
+  if (!currentWindow || currentWindow.webContents.isDestroyed()) return
+  currentWindow.webContents.send(channel, ...arguments_)
+}
+
+function showSettings(): void {
+  const currentWindow = showWindow()
+  if (!currentWindow || currentWindow.webContents.isDestroyed()) return
+  if (currentWindow.webContents.isLoadingMainFrame()) {
+    currentWindow.webContents.once('did-finish-load', () => {
+      if (!currentWindow.webContents.isDestroyed()) currentWindow.webContents.send('window:showSettings')
+    })
+    return
+  }
+  currentWindow.webContents.send('window:showSettings')
 }
 
 function registerIpc(): void {
@@ -129,9 +167,14 @@ function registerIpc(): void {
   ipcMain.handle('backend:removeVoiceModel', (_event, modelId: VoiceModelId) => sidecar.removeVoiceModel(modelId))
   ipcMain.handle('backend:startVoiceTest', () => sidecar.startVoiceTest())
   ipcMain.handle('backend:stopVoiceTest', () => sidecar.stopVoiceTest())
+  ipcMain.handle('backend:beginShortcutCapture', (_event, action) => sidecar.beginShortcutCapture(action))
+  ipcMain.handle('backend:cancelShortcutCapture', (_event, action) => sidecar.cancelShortcutCapture(action))
+  ipcMain.handle('backend:confirmShortcutReplacement', (_event, action) => sidecar.confirmShortcutReplacement(action))
+  ipcMain.handle('backend:clearShortcut', (_event, action) => sidecar.clearShortcut(action))
+  ipcMain.handle('backend:repairShortcutIntegration', () => sidecar.repairShortcutIntegration())
   ipcMain.handle('backend:shutdown', () => sidecar.shutdown())
-  ipcMain.on('window:minimize', () => window?.minimize())
-  ipcMain.on('window:close', () => window?.hide())
+  ipcMain.on('window:minimize', () => activeWindow()?.minimize())
+  ipcMain.on('window:close', () => activeWindow()?.hide())
 }
 
 async function installBundledGnomeExtension(): Promise<void> {
