@@ -1,15 +1,15 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub const PROTOCOL_VERSION: u16 = 11;
+pub const PROTOCOL_VERSION: u16 = 12;
 
-pub const PANEL_ZOOM_LEVELS: [u16; 6] = [80, 90, 100, 110, 125, 150];
+pub const PANEL_ZOOM_LEVELS: [u16; 10] = [80, 90, 100, 110, 125, 150, 175, 200, 225, 250];
 pub const PANEL_WIDTH_MIN: u16 = 420;
 pub const PANEL_WIDTH_DEFAULT: u16 = 560;
-pub const PANEL_WIDTH_MAX: u16 = 960;
+pub const PANEL_WIDTH_MAX: u16 = 1600;
 pub const PANEL_HEIGHT_MIN: u16 = 460;
 pub const PANEL_HEIGHT_DEFAULT: u16 = 460;
-pub const PANEL_HEIGHT_MAX: u16 = 800;
+pub const PANEL_HEIGHT_MAX: u16 = 850;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(transparent)]
@@ -60,7 +60,7 @@ impl TryFrom<u16> for PanelZoom {
         PANEL_ZOOM_LEVELS
             .contains(&value)
             .then_some(Self(value))
-            .ok_or("panel zoom must be one of 80, 90, 100, 110, 125, or 150")
+            .ok_or("panel zoom must be one of 80, 90, 100, 110, 125, 150, 175, 200, 225, or 250")
     }
 }
 
@@ -88,10 +88,10 @@ impl PanelSize {
 
     pub fn try_new(width: u16, height: u16) -> Result<Self, &'static str> {
         if !(PANEL_WIDTH_MIN..=PANEL_WIDTH_MAX).contains(&width) {
-            return Err("panel width must be between 420 and 960");
+            return Err("panel width must be between 420 and 1600");
         }
         if !(PANEL_HEIGHT_MIN..=PANEL_HEIGHT_MAX).contains(&height) {
-            return Err("panel height must be between 460 and 800");
+            return Err("panel height must be between 460 and 850");
         }
         Ok(Self { width, height })
     }
@@ -397,6 +397,94 @@ impl Default for VoiceSnapshot {
     }
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ShortcutAction {
+    TogglePanel,
+    VoiceInput,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ShortcutBinding {
+    pub modifiers: Vec<String>,
+    pub key: String,
+    pub display: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ShortcutConflict {
+    pub description: String,
+    pub dispatcher: String,
+    pub argument: String,
+    pub submap: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ShortcutBackend {
+    HyprlandPortal,
+    HyprlandEvent,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "state", rename_all = "camelCase")]
+pub enum ShortcutState {
+    Unconfigured,
+    Capturing,
+    Conflict {
+        candidate: ShortcutBinding,
+        conflicts: Vec<ShortcutConflict>,
+    },
+    Applying {
+        candidate: ShortcutBinding,
+    },
+    Ready {
+        binding: ShortcutBinding,
+        backend: ShortcutBackend,
+    },
+    Error {
+        message: String,
+        recoverable: bool,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShortcutActionsSnapshot {
+    pub toggle_panel: ShortcutState,
+    pub voice_input: ShortcutState,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShortcutCaptureSnapshot {
+    pub action: ShortcutAction,
+    pub pressed_keys: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ShortcutConfigFormat {
+    Lua,
+    LegacyHyprlang,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShortcutIntegrationSnapshot {
+    pub supported: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hyprland_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config_format: Option<ShortcutConfigFormat>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backend: Option<ShortcutBackend>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(tag = "state", rename_all = "camelCase")]
 pub enum ShortcutStatus {
@@ -426,8 +514,10 @@ pub struct BackendSnapshot {
     pub desktop_integration: DesktopIntegrationSnapshot,
     pub overlay_running: bool,
     pub voice: VoiceSnapshot,
-    pub shortcut_status: ShortcutStatus,
-    pub panel_shortcut_status: ShortcutStatus,
+    pub shortcut_actions: ShortcutActionsSnapshot,
+    pub shortcut_integration: ShortcutIntegrationSnapshot,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shortcut_capture: Option<ShortcutCaptureSnapshot>,
     pub experimental_chat: ExperimentalChatSnapshot,
 }
 
@@ -537,8 +627,18 @@ mod tests {
                 desktop_integration: DesktopIntegrationSnapshot::layer_shell_ready(),
                 overlay_running: false,
                 voice: VoiceSnapshot::default(),
-                shortcut_status: ShortcutStatus::Registering,
-                panel_shortcut_status: ShortcutStatus::Registering,
+                shortcut_actions: ShortcutActionsSnapshot {
+                    toggle_panel: ShortcutState::Unconfigured,
+                    voice_input: ShortcutState::Unconfigured,
+                },
+                shortcut_integration: ShortcutIntegrationSnapshot {
+                    supported: false,
+                    hyprland_version: None,
+                    config_format: None,
+                    backend: None,
+                    message: None,
+                },
+                shortcut_capture: None,
                 experimental_chat: ExperimentalChatSnapshot {
                     provider_id: ProviderId::ChatGpt,
                     experimental: true,
@@ -570,7 +670,10 @@ mod tests {
     fn panel_zoom_transitions_are_bounded_and_resettable() {
         let levels = PANEL_ZOOM_LEVELS.map(|level| PanelZoom::try_from(level).expect("valid zoom"));
         assert_eq!(levels[0].previous(), levels[0]);
-        assert_eq!(levels[5].next(), levels[5]);
+        assert_eq!(
+            levels.last().expect("zoom levels").next(),
+            *levels.last().expect("zoom levels")
+        );
         for pair in levels.windows(2) {
             assert_eq!(pair[0].next(), pair[1]);
             assert_eq!(pair[1].previous(), pair[0]);
@@ -583,10 +686,10 @@ mod tests {
         assert!(PanelZoom::try_from(95).is_err());
         assert!(serde_json::from_str::<PanelZoom>("95").is_err());
         assert_eq!(
-            serde_json::from_str::<PanelZoom>("125")
+            serde_json::from_str::<PanelZoom>("250")
                 .expect("valid zoom")
                 .value(),
-            125
+            250
         );
     }
 
@@ -598,7 +701,7 @@ mod tests {
             payload: PanelZoom::try_from(125).expect("valid zoom"),
         };
         let json = serde_json::to_value(event).expect("serialize event");
-        assert_eq!(json["protocolVersion"], 11);
+        assert_eq!(json["protocolVersion"], 12);
         assert_eq!(json["event"], "panelZoomChanged");
         assert_eq!(json["payload"], 125);
     }
@@ -610,11 +713,11 @@ mod tests {
             PanelSize::try_new(560, 460).expect("default")
         );
         assert!(PanelSize::try_new(420, 460).is_ok());
-        assert!(PanelSize::try_new(960, 800).is_ok());
+        assert!(PanelSize::try_new(1600, 850).is_ok());
         assert!(PanelSize::try_new(419, 460).is_err());
-        assert!(PanelSize::try_new(961, 460).is_err());
+        assert!(PanelSize::try_new(1601, 460).is_err());
         assert!(PanelSize::try_new(560, 459).is_err());
-        assert!(PanelSize::try_new(560, 801).is_err());
+        assert!(PanelSize::try_new(560, 851).is_err());
     }
 
     #[test]
@@ -636,7 +739,7 @@ mod tests {
             payload: PanelSize::try_new(720, 600).expect("valid panel size"),
         };
         let json = serde_json::to_value(event).expect("serialize event");
-        assert_eq!(json["protocolVersion"], 11);
+        assert_eq!(json["protocolVersion"], 12);
         assert_eq!(json["event"], "panelSizeChanged");
         assert_eq!(json["payload"]["width"], 720);
         assert_eq!(json["payload"]["height"], 600);

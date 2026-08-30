@@ -4,7 +4,7 @@ use crate::{
     AuthMethod, AuthenticationState, BackendSnapshot, DesktopIntegrationSnapshot,
     DesktopIntegrationStatus, ErrorCode, ExperimentalChatSnapshot, ExperimentalChatState, IpcError,
     LaunchBlocker, LaunchReadiness, ProviderId, ProviderKind, ProviderSnapshot, ProviderStatus,
-    ShortcutStatus, VoiceSnapshot,
+    ShortcutActionsSnapshot, ShortcutIntegrationSnapshot, ShortcutState, VoiceSnapshot,
 };
 
 const KEYRING_SERVICE: &str = "io.github.chathead_ai.ChatHead";
@@ -97,8 +97,9 @@ pub struct Backend {
     statuses: HashMap<ProviderId, ProviderStatus>,
     overlay_running: bool,
     voice: VoiceSnapshot,
-    shortcut_status: ShortcutStatus,
-    panel_shortcut_status: ShortcutStatus,
+    shortcut_actions: ShortcutActionsSnapshot,
+    shortcut_integration: ShortcutIntegrationSnapshot,
+    shortcut_capture: Option<crate::ShortcutCaptureSnapshot>,
     experimental_chat: ExperimentalChatSnapshot,
     desktop_integration: DesktopIntegrationSnapshot,
 }
@@ -131,8 +132,18 @@ impl Backend {
             statuses,
             overlay_running: false,
             voice: VoiceSnapshot::default(),
-            shortcut_status: ShortcutStatus::Registering,
-            panel_shortcut_status: ShortcutStatus::Registering,
+            shortcut_actions: ShortcutActionsSnapshot {
+                toggle_panel: ShortcutState::Unconfigured,
+                voice_input: ShortcutState::Unconfigured,
+            },
+            shortcut_integration: ShortcutIntegrationSnapshot {
+                supported: false,
+                hyprland_version: None,
+                config_format: None,
+                backend: None,
+                message: Some("Shortcut integration has not been detected yet.".to_owned()),
+            },
+            shortcut_capture: None,
             experimental_chat: ExperimentalChatSnapshot {
                 provider_id: ProviderId::ChatGpt,
                 experimental: true,
@@ -167,18 +178,26 @@ impl Backend {
             desktop_integration: self.desktop_integration.clone(),
             overlay_running: self.overlay_running,
             voice: self.voice.clone(),
-            shortcut_status: self.shortcut_status.clone(),
-            panel_shortcut_status: self.panel_shortcut_status.clone(),
+            shortcut_actions: self.shortcut_actions.clone(),
+            shortcut_integration: self.shortcut_integration.clone(),
+            shortcut_capture: self.shortcut_capture.clone(),
             experimental_chat: self.experimental_chat.clone(),
         }
     }
 
-    pub fn set_shortcut_status(&mut self, shortcut_status: ShortcutStatus) {
-        self.shortcut_status = shortcut_status;
+    pub fn set_shortcut_actions(&mut self, shortcut_actions: ShortcutActionsSnapshot) {
+        self.shortcut_actions = shortcut_actions;
     }
 
-    pub fn set_panel_shortcut_status(&mut self, shortcut_status: ShortcutStatus) {
-        self.panel_shortcut_status = shortcut_status;
+    pub fn set_shortcut_integration(&mut self, shortcut_integration: ShortcutIntegrationSnapshot) {
+        self.shortcut_integration = shortcut_integration;
+    }
+
+    pub fn set_shortcut_capture(
+        &mut self,
+        shortcut_capture: Option<crate::ShortcutCaptureSnapshot>,
+    ) {
+        self.shortcut_capture = shortcut_capture;
     }
 
     pub fn save_api_key(
@@ -389,6 +408,23 @@ fn validate_api_key(provider_id: ProviderId, key: &str) -> Result<(), BackendErr
 mod tests {
     use super::*;
 
+    fn shortcut_actions() -> ShortcutActionsSnapshot {
+        ShortcutActionsSnapshot {
+            toggle_panel: ShortcutState::Unconfigured,
+            voice_input: ShortcutState::Unconfigured,
+        }
+    }
+
+    fn shortcut_integration() -> ShortcutIntegrationSnapshot {
+        ShortcutIntegrationSnapshot {
+            supported: false,
+            hyprland_version: None,
+            config_format: None,
+            backend: None,
+            message: None,
+        }
+    }
+
     #[test]
     fn validates_provider_specific_key_shapes() {
         assert!(validate_api_key(ProviderId::ChatGpt, "sk-12345678901234567").is_ok());
@@ -421,8 +457,9 @@ mod tests {
             statuses: HashMap::new(),
             overlay_running: false,
             voice: VoiceSnapshot::default(),
-            shortcut_status: ShortcutStatus::Registering,
-            panel_shortcut_status: ShortcutStatus::Registering,
+            shortcut_actions: shortcut_actions(),
+            shortcut_integration: shortcut_integration(),
+            shortcut_capture: None,
             experimental_chat: ExperimentalChatSnapshot {
                 provider_id: ProviderId::ChatGpt,
                 experimental: true,
@@ -449,8 +486,9 @@ mod tests {
             statuses: HashMap::new(),
             overlay_running: false,
             voice: VoiceSnapshot::default(),
-            shortcut_status: ShortcutStatus::Registering,
-            panel_shortcut_status: ShortcutStatus::Registering,
+            shortcut_actions: shortcut_actions(),
+            shortcut_integration: shortcut_integration(),
+            shortcut_capture: None,
             experimental_chat: ExperimentalChatSnapshot {
                 provider_id: ProviderId::ChatGpt,
                 experimental: true,
@@ -477,8 +515,9 @@ mod tests {
             statuses: HashMap::new(),
             overlay_running: false,
             voice: VoiceSnapshot::default(),
-            shortcut_status: ShortcutStatus::Registering,
-            panel_shortcut_status: ShortcutStatus::Registering,
+            shortcut_actions: shortcut_actions(),
+            shortcut_integration: shortcut_integration(),
+            shortcut_capture: None,
             experimental_chat: ExperimentalChatSnapshot {
                 provider_id: ProviderId::ChatGpt,
                 experimental: true,
@@ -513,27 +552,24 @@ mod tests {
     }
 
     #[test]
-    fn global_shortcut_statuses_are_tracked_independently() {
+    fn shortcut_action_states_are_tracked_independently() {
         let mut backend = Backend::new();
-        backend.set_shortcut_status(ShortcutStatus::Ready {
-            trigger: "Super+E".to_owned(),
-        });
-        backend.set_panel_shortcut_status(ShortcutStatus::ConflictPossible {
-            details: "Super+W is reserved".to_owned(),
+        backend.set_shortcut_actions(ShortcutActionsSnapshot {
+            voice_input: ShortcutState::Error {
+                message: "Capture unavailable".to_owned(),
+                recoverable: true,
+            },
+            toggle_panel: ShortcutState::Unconfigured,
         });
 
         let snapshot = backend.snapshot();
-        assert_eq!(
-            snapshot.shortcut_status,
-            ShortcutStatus::Ready {
-                trigger: "Super+E".to_owned(),
-            }
-        );
-        assert_eq!(
-            snapshot.panel_shortcut_status,
-            ShortcutStatus::ConflictPossible {
-                details: "Super+W is reserved".to_owned(),
-            }
-        );
+        assert!(matches!(
+            snapshot.shortcut_actions.toggle_panel,
+            ShortcutState::Unconfigured
+        ));
+        assert!(matches!(
+            snapshot.shortcut_actions.voice_input,
+            ShortcutState::Error { .. }
+        ));
     }
 }
