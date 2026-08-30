@@ -139,6 +139,41 @@ pub(crate) struct StableMarkdownPrefix {
     pub(crate) stable_len: usize,
 }
 
+#[derive(Clone, Debug, Default)]
+pub(crate) struct StableMarkdownTracker {
+    scanned_len: usize,
+    stable_len: usize,
+    fence: Option<(char, usize)>,
+}
+
+impl StableMarkdownTracker {
+    pub(crate) fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    pub(crate) fn update(&mut self, source: &str) -> StableMarkdownPrefix {
+        if self.scanned_len > source.len() || !source.is_char_boundary(self.scanned_len) {
+            self.reset();
+        }
+
+        let mut offset = self.scanned_len;
+        for line in source[self.scanned_len..].split_inclusive('\n') {
+            // An unfinished line may receive more bytes in the next delta, so
+            // leave it unscanned until its terminating newline arrives.
+            if !line.ends_with('\n') {
+                break;
+            }
+            update_stable_markdown_line(line, offset, &mut self.stable_len, &mut self.fence);
+            offset += line.len();
+            self.scanned_len = offset;
+        }
+
+        StableMarkdownPrefix {
+            stable_len: self.stable_len,
+        }
+    }
+}
+
 impl ResponseDocument {
     #[must_use]
     pub(crate) fn parse(source: &str, terminal: bool) -> Self {
@@ -280,6 +315,7 @@ fn normalize_math_line(line: &str, output: &mut String) {
 }
 
 #[must_use]
+#[cfg(test)]
 pub(crate) fn stable_markdown_prefix(source: &str) -> StableMarkdownPrefix {
     let mut stable_len = 0;
     let mut offset = 0;
@@ -308,6 +344,32 @@ pub(crate) fn stable_markdown_prefix(source: &str) -> StableMarkdownPrefix {
     }
 
     StableMarkdownPrefix { stable_len }
+}
+
+fn update_stable_markdown_line(
+    line: &str,
+    offset: usize,
+    stable_len: &mut usize,
+    fence: &mut Option<(char, usize)>,
+) {
+    let trimmed = line.trim_start();
+    let marker = trimmed.chars().next();
+    let run = marker.map_or(0, |character| {
+        trimmed
+            .chars()
+            .take_while(|next| *next == character)
+            .count()
+    });
+    if let Some((character, width)) = *fence {
+        if marker == Some(character) && run >= width && trimmed[run..].trim().is_empty() {
+            *fence = None;
+            *stable_len = offset + line.len();
+        }
+    } else if matches!(marker, Some('`' | '~')) && run >= 3 {
+        *fence = Some((marker.expect("matched fence marker"), run));
+    } else if trimmed.trim().is_empty() {
+        *stable_len = offset + line.len();
+    }
 }
 
 #[must_use]
@@ -930,6 +992,25 @@ mod tests {
             let current = stable_markdown_prefix(&source[..boundary]).stable_len;
             assert!(current >= previous, "prefix regressed at byte {boundary}");
             previous = current;
+        }
+    }
+
+    #[test]
+    fn incremental_stable_prefix_matches_complete_line_scans() {
+        let source = "First paragraph.\n\n- one\n- two\n\n```rust\nlet x = 1;\n```\n\nFinal";
+        let mut tracker = StableMarkdownTracker::default();
+
+        for boundary in source
+            .char_indices()
+            .map(|(index, _)| index)
+            .skip(1)
+            .chain([source.len()])
+        {
+            let chunk = &source[..boundary];
+            let tracked = tracker.update(chunk).stable_len;
+            let complete_line_len = chunk.rfind('\n').map_or(0, |index| index + 1);
+            let expected = stable_markdown_prefix(&chunk[..complete_line_len]).stable_len;
+            assert_eq!(tracked, expected, "tracker diverged at byte {boundary}");
         }
     }
 

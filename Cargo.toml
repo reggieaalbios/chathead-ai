@@ -10,7 +10,7 @@ license = "MIT"
 
 [workspace.dependencies]
 anyhow = "1.0"
-ashpd = { version = "0.13.13", default-features = false, features = ["global_shortcuts", "tokio"] }
+ashpd = { version = "0.13.13", default-features = false, features = ["file_chooser", "global_shortcuts", "tokio"] }
 bzip2 = "0.6"
 cpal = { version = "0.18.1", features = ["pipewire", "pulseaudio"] }
 futures-util = "0.3.33"
@@ -25,9 +25,10 @@ sha2 = "0.10"
 sherpa-onnx = "1.13.4"
 thiserror = "2.0"
 tar = "0.4"
-tokio = { version = "1.53.1", default-features = false, features = ["io-util", "macros", "process", "rt", "sync", "time"] }
+tokio = { version = "1.53.1", default-features = false, features = ["io-util", "macros", "net", "process", "rt", "sync", "time"] }
 ureq = { version = "3.2", default-features = false, features = ["rustls"] }
 syntect = { version = "=5.3.0", default-features = false, features = ["default-syntaxes", "default-themes", "regex-fancy"] }
+tempfile = "3.23"
 url = "=2.5.8"
 
 [workspace.lints.rust]

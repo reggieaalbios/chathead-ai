@@ -20,6 +20,7 @@ const READINESS_XML = `<node><interface name="io.github.chathead_ai.ChatHead.Gno
 
 const PRESENTATION_XML = `<node><interface name="${PRESENTATION_IFACE}">
   <method name="GetPresentationSnapshot"><arg type="s" name="snapshot" direction="out"/></method>
+  <method name="GetAttachment"><arg type="s" name="attachment_id" direction="in"/><arg type="s" name="mime_type" direction="out"/><arg type="ay" name="bytes" direction="out"/></method>
   <method name="TogglePanel"/><method name="Send"><arg type="s" name="text" direction="in"/></method>
   <method name="StopResponse"/><method name="Retry"><arg type="s" name="message_id" direction="in"/></method>
   <method name="NewChat"/><method name="ActivateVoice"/><method name="CancelVoice"/>

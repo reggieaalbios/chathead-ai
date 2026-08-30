@@ -3,9 +3,10 @@
 use std::{cell::RefCell, rc::Rc};
 
 use chathead_core::{
-    ChatMessage, CodexAppServer, CodexCommand, CodexEvent, Conversation, ExperimentalChatSnapshot,
-    ExperimentalChatState, IpcEvent, MessageRole, MessageState, PROTOCOL_VERSION, PanelSize,
-    PanelZoom, ShortcutStatus, VoicePhase, VoiceSnapshot, VoiceSubmissionMode,
+    ChatAttachment, ChatMessage, ChatPrompt, CodexAppServer, CodexCommand, CodexEvent,
+    Conversation, ExperimentalChatSnapshot, ExperimentalChatState, IpcEvent, MessageRole,
+    MessageState, PROTOCOL_VERSION, PanelSize, PanelZoom, ShortcutStatus, VoicePhase,
+    VoiceSnapshot, VoiceSubmissionMode,
 };
 use chathead_voice::{VoiceEvent, VoiceService};
 use gtk::{gdk, gio, glib, prelude::*};
@@ -24,6 +25,7 @@ const INTERFACE: &str = "io.github.chathead_ai.ChatHead.Presentation1";
 const INTROSPECTION_XML: &str = r#"
 <node><interface name="io.github.chathead_ai.ChatHead.Presentation1">
   <method name="GetPresentationSnapshot"><arg type="s" name="snapshot" direction="out"/></method>
+  <method name="GetAttachment"><arg type="s" name="attachment_id" direction="in"/><arg type="s" name="mime_type" direction="out"/><arg type="ay" name="bytes" direction="out"/></method>
   <method name="TogglePanel"/><method name="Send"><arg type="s" name="text" direction="in"/></method>
   <method name="StopResponse"/><method name="Retry"><arg type="s" name="message_id" direction="in"/></method>
   <method name="NewChat"/><method name="ActivateVoice"/><method name="CancelVoice"/>
@@ -47,6 +49,8 @@ struct PresentationMessage {
     role: MessageRole,
     state: MessageState,
     text: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    attachments: Vec<ChatAttachment>,
     #[serde(skip_serializing_if = "Option::is_none")]
     document: Option<ResponseDocument>,
     plain_text: String,
@@ -66,6 +70,7 @@ impl From<&ChatMessage> for PresentationMessage {
             role: message.role,
             state: message.state,
             text: message.text.clone(),
+            attachments: message.attachments.clone(),
             document,
             plain_text,
             markdown: message.text.clone(),
@@ -188,14 +193,18 @@ impl OverlayController {
     }
 
     fn send(&mut self, text: &str) {
-        match self.conversation.send(text) {
+        self.send_prompt(ChatPrompt::text(text));
+    }
+
+    fn send_prompt(&mut self, prompt: ChatPrompt) {
+        match self.conversation.send_prompt(prompt.clone()) {
             Ok(message_id) => {
                 self.failure = None;
                 if self
                     .codex
                     .send(CodexCommand::SendMessage {
                         message_id: message_id.clone(),
-                        text: text.trim().to_owned(),
+                        prompt,
                     })
                     .is_err()
                 {
@@ -394,6 +403,7 @@ pub(crate) fn handle_global_app_event(event: &crate::overlay::AppEvent) {
             state.changed();
         }),
         crate::overlay::AppEvent::ShortcutStatus(_, _) => {}
+        crate::overlay::AppEvent::ConfigReloaded => {}
     }
 }
 pub(crate) fn set_appearance(value: OrbTheme) {
@@ -466,6 +476,38 @@ fn handle_method(method: &str, parameters: &glib::Variant, invocation: gio::DBus
             invocation.return_value(Some(&(snapshot_json(),).to_variant()));
             return;
         }
+        "GetAttachment" => {
+            let id = parameters.child_get::<String>(0);
+            let attachment = CONTROLLER.with(|stored| {
+                stored.borrow().as_ref().and_then(|controller| {
+                    controller
+                        .borrow()
+                        .conversation
+                        .messages()
+                        .iter()
+                        .flat_map(|message| &message.attachments)
+                        .find(|attachment| attachment.id == id)
+                        .cloned()
+                })
+            });
+            let Some(attachment) = attachment else {
+                invocation.return_dbus_error(
+                    "io.github.chathead_ai.ChatHead.Error.UnknownAttachment",
+                    "unknown attachment",
+                );
+                return;
+            };
+            match std::fs::read(&attachment.path) {
+                Ok(bytes) => {
+                    invocation.return_value(Some(&(attachment.mime_type, bytes).to_variant()))
+                }
+                Err(_) => invocation.return_dbus_error(
+                    "io.github.chathead_ai.ChatHead.Error.AttachmentUnavailable",
+                    "attachment is unavailable",
+                ),
+            }
+            return;
+        }
         "TogglePanel" => with_controller_mut(|state| {
             state.panel_open = !state.panel_open;
             state.changed();
@@ -477,12 +519,8 @@ fn handle_method(method: &str, parameters: &glib::Variant, invocation: gio::DBus
         }),
         "Retry" => with_controller_mut(|state| {
             let id = parameters.child_get::<String>(0);
-            if let Some(prompt) = state
-                .conversation
-                .prompt_for_assistant(&id)
-                .map(str::to_owned)
-            {
-                state.send(&prompt);
+            if let Some(prompt) = state.conversation.prompt_for_assistant(&id) {
+                state.send_prompt(prompt);
             }
         }),
         "NewChat" => with_controller_mut(|state| {
@@ -578,11 +616,36 @@ mod tests {
             id: "assistant-1".to_owned(),
             role: MessageRole::Assistant,
             text: "**Hello** [site](https://example.com)".to_owned(),
+            attachments: Vec::new(),
             state: MessageState::Complete,
         };
         let projection = PresentationMessage::from(&message);
         assert_eq!(projection.plain_text, "Hello site (https://example.com)");
         assert!(projection.document.is_some());
         assert_eq!(projection.markdown, message.text);
+    }
+
+    #[test]
+    fn attachment_projection_exposes_metadata_but_not_the_private_path() {
+        let message = ChatMessage {
+            id: "user-1".to_owned(),
+            role: MessageRole::User,
+            text: String::new(),
+            attachments: vec![ChatAttachment {
+                id: "image-1".to_owned(),
+                path: std::path::PathBuf::from("/private/session/image-1.png"),
+                mime_type: "image/png".to_owned(),
+                width: 640,
+                height: 480,
+                byte_len: 1234,
+            }],
+            state: MessageState::Complete,
+        };
+
+        let value = serde_json::to_value(PresentationMessage::from(&message)).expect("serialize");
+
+        assert_eq!(value["attachments"][0]["id"], "image-1");
+        assert_eq!(value["attachments"][0]["mimeType"], "image/png");
+        assert!(!value.to_string().contains("/private/session"));
     }
 }

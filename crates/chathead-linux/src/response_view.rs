@@ -20,8 +20,8 @@ use syntect::{
 };
 
 use crate::response_format::{
-    DefinitionItem, InlineSpan, ListItem, ResponseBlock, ResponseDocument, TableAlignment,
-    inline_pango_markup, stable_markdown_prefix,
+    DefinitionItem, InlineSpan, ListItem, ResponseBlock, ResponseDocument, StableMarkdownTracker,
+    TableAlignment, inline_pango_markup,
 };
 
 const MAX_HIGHLIGHT_BYTES: usize = 64 * 1024;
@@ -98,11 +98,13 @@ pub(crate) struct AssistantDocument {
     root: gtk::Box,
     stable: gtk::Box,
     provisional: gtk::Box,
+    provisional_label: gtk::Label,
     actions: gtk::Box,
     source: Rc<RefCell<String>>,
     state: Rc<Cell<MessageState>>,
     revision: Rc<Cell<u64>>,
     stable_len: Rc<Cell<usize>>,
+    stable_tracker: Rc<RefCell<StableMarkdownTracker>>,
     stable_blocks: Rc<RefCell<Vec<ResponseBlock>>>,
     theme: Rc<Cell<DocumentTheme>>,
     code_labels: Rc<RefCell<HashMap<usize, gtk::Label>>>,
@@ -131,6 +133,8 @@ impl AssistantDocument {
             .build();
         let stable = document_box("assistant-stable");
         let provisional = document_box("assistant-provisional");
+        let provisional_label = plain_label("", "response-paragraph");
+        provisional.append(&provisional_label);
         stable.set_visible(false);
         provisional.set_visible(false);
         let actions = gtk::Box::builder()
@@ -149,11 +153,13 @@ impl AssistantDocument {
             root,
             stable,
             provisional,
+            provisional_label,
             actions,
             source: Rc::new(RefCell::new(String::new())),
             state: Rc::new(Cell::new(MessageState::Streaming)),
             revision: Rc::new(Cell::new(0)),
             stable_len: Rc::new(Cell::new(0)),
+            stable_tracker: Rc::new(RefCell::new(StableMarkdownTracker::default())),
             stable_blocks: Rc::new(RefCell::new(Vec::new())),
             theme: Rc::new(Cell::new(theme)),
             code_labels: Rc::new(RefCell::new(HashMap::new())),
@@ -170,6 +176,14 @@ impl AssistantDocument {
         self.root.clone()
     }
 
+    pub(crate) fn update_theme(&self, theme: DocumentTheme) {
+        if self.theme.get() == theme {
+            return;
+        }
+        let source = self.source.borrow().clone();
+        self.update(&source, self.state.get(), theme);
+    }
+
     pub(crate) fn update(&self, source: &str, state: MessageState, theme: DocumentTheme) {
         if self.source.borrow().as_str() == source
             && self.state.get() == state
@@ -178,20 +192,88 @@ impl AssistantDocument {
             return;
         }
 
+        let previous_state = self.state.get();
         let theme_changed = self.theme.replace(theme) != theme;
-        let revision = self.revision.get().saturating_add(1);
-        self.revision.set(revision);
-        self.source.replace(source.to_owned());
+        let mut stored_source = self.source.borrow_mut();
+        let appended = source.starts_with(stored_source.as_str());
+        if appended {
+            let previous_len = stored_source.len();
+            stored_source.push_str(&source[previous_len..]);
+        } else {
+            stored_source.clear();
+            stored_source.push_str(source);
+        }
+        drop(stored_source);
+        if !appended {
+            self.stable_tracker.borrow_mut().reset();
+        }
         self.state.set(state);
-        self.code_labels.borrow_mut().clear();
 
         let terminal = state != MessageState::Streaming;
-        if terminal || theme_changed {
-            self.rebuild_complete(source, terminal);
+        if theme_changed {
+            self.reset_rendered_document();
+            if terminal {
+                self.rebuild_complete(source);
+            } else {
+                self.reconcile_stream(source);
+            }
+        } else if terminal && previous_state == MessageState::Streaming {
+            self.reconcile_stream(source);
+            self.finalize_stream(source);
+        } else if terminal {
+            self.reset_rendered_document();
+            self.rebuild_complete(source);
         } else {
             self.reconcile_stream(source);
         }
-        self.rebuild_actions(terminal);
+        if terminal {
+            self.rebuild_actions();
+        }
+    }
+
+    fn reset_rendered_document(&self) {
+        self.revision.set(self.revision.get().saturating_add(1));
+        self.code_labels.borrow_mut().clear();
+        clear_box(&self.stable);
+        self.stable_blocks.borrow_mut().clear();
+        self.stable_len.set(0);
+    }
+
+    fn rebuild_complete(&self, source: &str) {
+        clear_box(&self.stable);
+        self.provisional_label.set_label("");
+        self.provisional.set_visible(false);
+        let document = ResponseDocument::parse(source, true);
+        let mut block_index = 0;
+        render_blocks(
+            &document.blocks,
+            &self.stable,
+            &mut block_index,
+            &RenderContext::from_document(self),
+        );
+        self.stable.set_visible(self.stable.first_child().is_some());
+        self.stable_blocks.replace(document.blocks);
+        self.stable_len.set(source.len());
+    }
+
+    fn finalize_stream(&self, source: &str) {
+        let stable_len = self.stable_len.get();
+        let tail = &source[stable_len..];
+        if !tail.is_empty() {
+            let tail_document = ResponseDocument::parse(tail, true);
+            let mut block_index = count_code_blocks(&self.stable_blocks.borrow());
+            render_blocks(
+                &tail_document.blocks,
+                &self.stable,
+                &mut block_index,
+                &RenderContext::from_document(self),
+            );
+            self.stable_blocks.borrow_mut().extend(tail_document.blocks);
+        }
+        self.stable_len.set(source.len());
+        self.stable.set_visible(self.stable.first_child().is_some());
+        self.provisional_label.set_label("");
+        self.provisional.set_visible(false);
     }
 
     pub(crate) fn apply_highlight(&self, result: &HighlightResult) -> bool {
@@ -207,84 +289,60 @@ impl AssistantDocument {
         true
     }
 
-    fn rebuild_complete(&self, source: &str, terminal: bool) {
-        clear_box(&self.stable);
-        clear_box(&self.provisional);
-        let document = ResponseDocument::parse(source, terminal);
-        let mut block_index = 0;
-        render_blocks(
-            &document.blocks,
-            &self.stable,
-            &mut block_index,
-            &RenderContext::from_document(self),
-        );
-        self.stable.set_visible(self.stable.first_child().is_some());
-        self.provisional.set_visible(false);
-        self.stable_blocks.replace(document.blocks);
-        self.stable_len.set(source.len());
-    }
-
     fn reconcile_stream(&self, source: &str) {
-        let stable_len = stable_markdown_prefix(source).stable_len;
-        let stable_document = ResponseDocument::parse(&source[..stable_len], false);
-        let previous = self.stable_blocks.borrow();
-        let preserves_prefix = stable_document.blocks.starts_with(previous.as_slice());
-        let old_count = previous.len();
-        drop(previous);
+        let stable_len = self.stable_tracker.borrow_mut().update(source).stable_len;
+        let previous_stable_len = self.stable_len.get();
 
-        if stable_len < self.stable_len.get() || !preserves_prefix {
-            clear_box(&self.stable);
-            let mut block_index = 0;
-            render_blocks(
-                &stable_document.blocks,
-                &self.stable,
-                &mut block_index,
-                &RenderContext::from_document(self),
-            );
-        } else if stable_document.blocks.len() > old_count {
-            let mut block_index = count_code_blocks(&stable_document.blocks[..old_count]);
-            render_blocks(
-                &stable_document.blocks[old_count..],
-                &self.stable,
-                &mut block_index,
-                &RenderContext::from_document(self),
-            );
+        if stable_len != previous_stable_len {
+            let stable_document = ResponseDocument::parse(&source[..stable_len], false);
+            let previous = self.stable_blocks.borrow();
+            let preserves_prefix = stable_document.blocks.starts_with(previous.as_slice());
+            let old_count = previous.len();
+            drop(previous);
+
+            if stable_len < previous_stable_len || !preserves_prefix {
+                self.revision.set(self.revision.get().saturating_add(1));
+                self.code_labels.borrow_mut().clear();
+                clear_box(&self.stable);
+                let mut block_index = 0;
+                render_blocks(
+                    &stable_document.blocks,
+                    &self.stable,
+                    &mut block_index,
+                    &RenderContext::from_document(self),
+                );
+            } else if stable_document.blocks.len() > old_count {
+                let mut block_index = count_code_blocks(&stable_document.blocks[..old_count]);
+                render_blocks(
+                    &stable_document.blocks[old_count..],
+                    &self.stable,
+                    &mut block_index,
+                    &RenderContext::from_document(self),
+                );
+            }
+            self.stable_blocks.replace(stable_document.blocks);
+            self.stable_len.set(stable_len);
+            self.stable.set_visible(self.stable.first_child().is_some());
         }
-        self.stable_blocks.replace(stable_document.blocks);
-        self.stable_len.set(stable_len);
-        self.stable.set_visible(self.stable.first_child().is_some());
 
-        clear_box(&self.provisional);
         let tail = &source[stable_len..];
-        if !tail.is_empty() {
-            let tail_document = ResponseDocument::parse(tail, false);
-            let mut block_index = count_code_blocks(&self.stable_blocks.borrow());
-            render_blocks(
-                &tail_document.blocks,
-                &self.provisional,
-                &mut block_index,
-                &RenderContext::from_document(self),
-            );
-        }
-        self.provisional
-            .set_visible(self.provisional.first_child().is_some());
+        self.provisional_label.set_label(tail);
+        self.provisional.set_visible(!tail.is_empty());
     }
 
-    fn rebuild_actions(&self, terminal: bool) {
+    fn rebuild_actions(&self) {
         clear_box(&self.actions);
-        self.actions.set_visible(terminal);
-        if !terminal {
-            return;
-        }
+        self.actions.set_visible(true);
         let copy = gtk::Button::builder()
             .icon_name("edit-copy-symbolic")
             .tooltip_text("Copy response")
             .focusable(true)
             .css_classes(["response-action"])
             .build();
-        let source = self.source.borrow().clone();
-        let plain = ResponseDocument::parse(&source, true).plain_text();
+        let source = Rc::clone(&self.source);
         copy.connect_clicked(move |button| {
+            let source = source.borrow();
+            let plain = ResponseDocument::parse(&source, true).plain_text();
             copy_response_to_clipboard(button, &plain, &source);
         });
         self.actions.append(&copy);
@@ -791,6 +849,7 @@ pub(crate) fn open_confirmed_uri(destination: &str) -> Result<(), glib::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::response_format::stable_markdown_prefix;
 
     #[test]
     fn large_code_is_not_submitted_for_highlighting() {
@@ -862,5 +921,23 @@ mod tests {
             "Rendered"
         );
         assert_eq!(response_clipboard_text("", "**Fallback**"), "**Fallback**");
+    }
+
+    #[test]
+    fn finalizing_only_the_unstable_tail_matches_a_complete_parse() {
+        let responses = [
+            "# Title\n\nFirst **paragraph**.\n\nFinal paragraph.",
+            "> quoted text\n\n1. one\n2. two\n\n- final item\n",
+            "| Left | Right |\n|:--|--:|\n| a | b |\n\n```rust\nfn main() {}\n```\n",
+            "Before math.\n\n\\[x^2 + y^2\\]\n\nAfter math.",
+        ];
+
+        for source in responses {
+            let stable_len = stable_markdown_prefix(source).stable_len;
+            let mut streamed = ResponseDocument::parse(&source[..stable_len], false).blocks;
+            streamed.extend(ResponseDocument::parse(&source[stable_len..], true).blocks);
+
+            assert_eq!(streamed, ResponseDocument::parse(source, true).blocks);
+        }
     }
 }

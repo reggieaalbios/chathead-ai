@@ -472,7 +472,7 @@ impl Worker {
             started: Instant::now(),
         });
         self.shortcut_flow = ShortcutFlow::default();
-        self.update_ready_message("Switching microphone… Super+E will be ready shortly.");
+        self.update_ready_message("Switching microphone… Voice input will be ready shortly.");
 
         let sender = self.device_switch_sender.clone();
         let spawn = thread::Builder::new()
@@ -824,7 +824,7 @@ impl Worker {
         }
         if self.pending_device_switch.is_some() {
             self.shortcut_flow = ShortcutFlow::default();
-            self.ready("Microphone switch is still in progress. Try Super+E again shortly.");
+            self.ready("Microphone switch is still in progress. Try voice input again shortly.");
             return;
         }
         match self.capture.start(self.config.input_device_id.as_deref()) {

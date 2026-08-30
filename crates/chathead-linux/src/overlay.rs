@@ -2,6 +2,9 @@
 
 use std::{
     cell::{Cell, RefCell},
+    collections::BTreeMap,
+    env, fs,
+    path::PathBuf,
     rc::Rc,
     sync::{
         atomic::{AtomicU8, AtomicU16, Ordering},
@@ -13,20 +16,23 @@ use std::{
 
 use ashpd::desktop::{
     CreateSessionOptions,
+    file_chooser::SelectedFiles,
     global_shortcuts::{BindShortcutsOptions, GlobalShortcuts, NewShortcut},
 };
 use chathead_core::{
-    ChatMessage, CodexAppServer, CodexCommand, CodexEvent, Conversation, ExperimentalChatSnapshot,
+    AgentActivity, AgentQuestion, AgentRequestId, ChatAttachment, ChatMessage, ChatMode,
+    ChatPrompt, CodexAppServer, CodexCommand, CodexEvent, Conversation, ExperimentalChatSnapshot,
     ExperimentalChatState, IpcEvent, MessageRole, MessageState, PANEL_HEIGHT_DEFAULT,
     PANEL_HEIGHT_MAX, PANEL_HEIGHT_MIN, PANEL_WIDTH_DEFAULT, PANEL_WIDTH_MAX, PANEL_WIDTH_MIN,
-    PROTOCOL_VERSION, PanelSize, PanelZoom, ShortcutStatus as ProtocolShortcutStatus, VoicePhase,
-    VoiceSnapshot, VoiceSubmissionMode,
+    PROTOCOL_VERSION, PanelSize, PanelZoom, ShortcutAction as CoreShortcutAction, ShortcutBackend,
+    ShortcutStatus as ProtocolShortcutStatus, VoicePhase, VoiceSnapshot, VoiceSubmissionMode,
 };
 use chathead_voice::{VoiceEvent, VoiceService};
-use futures_util::StreamExt;
-use gtk::{cairo, gdk, glib, prelude::*};
+use futures_util::{FutureExt, StreamExt};
+use gtk::{cairo, gdk, gio, glib, prelude::*};
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncBufReadExt, BufReader as AsyncBufReader};
 
 use crate::response_view::{
     AssistantDocument, DocumentTheme, HighlightWorker, LinkHandler, RetryHandler,
@@ -34,11 +40,14 @@ use crate::response_view::{
 };
 
 const VOICE_TOGGLE_ID: &str = "voice_toggle";
-const VOICE_TOGGLE_TRIGGER: &str = "LOGO+e";
-const VOICE_TOGGLE_LABEL: &str = "Super+E";
 const PANEL_TOGGLE_ID: &str = "panel_toggle";
-const PANEL_TOGGLE_TRIGGER: &str = "LOGO+w";
-const PANEL_TOGGLE_LABEL: &str = "Super+W";
+const MAX_PROMPT_ATTACHMENTS: usize = 10;
+const MAX_IMAGE_PIXELS: u64 = 25_000_000;
+const MAX_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
+const MAX_PROMPT_IMAGE_BYTES: u64 = 80 * 1024 * 1024;
+const COMPOSER_ATTACHMENT_MAX_SIZE: i32 = 112;
+const TRANSCRIPT_ATTACHMENT_MAX_WIDTH: i32 = 320;
+const TRANSCRIPT_ATTACHMENT_MAX_HEIGHT: i32 = 240;
 const CHATHEAD_SIZE: i32 = 84;
 const PANEL_GAP: i32 = 10;
 const EDGE_PADDING: i32 = 16;
@@ -47,7 +56,10 @@ const RESIZE_CORNER_HIT_ZONE: f64 = 24.0;
 const CLICK_THRESHOLD: f64 = 5.0;
 const ACTION_POLL_MS: u64 = 40;
 const ANIMATION_FRAME_MS: u64 = 33;
-const STREAM_RENDER_INTERVAL_MS: u64 = 33;
+// Streaming text does not need to repaint at the compositor's frame rate. A
+// 20 Hz document update leaves GTK's main loop enough time for input, scrolling,
+// and the 60 Hz transcript animation while still feeling immediate.
+const STREAM_RENDER_INTERVAL_MS: u64 = 50;
 const TRANSCRIPT_SCROLL_FRAME_MS: u64 = 16;
 const TRANSCRIPT_FOCUS_SCROLL_FACTOR: f64 = 0.30;
 const TRANSCRIPT_WHEEL_SCROLL_FACTOR: f64 = 0.42;
@@ -81,6 +93,29 @@ struct PanelMetrics {
     title_font: i32,
     body_font: i32,
     small_font: i32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ComposerLayout {
+    Compact,
+    Expanded,
+}
+
+impl ComposerLayout {
+    fn for_visual_lines(line_count: i32) -> Self {
+        if line_count > 1 {
+            Self::Expanded
+        } else {
+            Self::Compact
+        }
+    }
+
+    fn max_content_height(self, metrics: PanelMetrics) -> i32 {
+        match self {
+            Self::Compact => metrics.composer_view_height,
+            Self::Expanded => metrics.composer_max_height,
+        }
+    }
 }
 
 impl PanelMetrics {
@@ -177,11 +212,7 @@ pub(crate) fn set_native_overlay_theme(app: &gtk::Application, theme: OrbTheme) 
             let anchor = TranscriptAnchor::capture(&runtime.widgets.transcript_scroll);
             for rendered in runtime.rendered_messages.borrow().iter() {
                 if let Some(document) = &rendered.document {
-                    document.update(
-                        &rendered.rendered_text,
-                        rendered.rendered_state,
-                        theme.into(),
-                    );
+                    document.update_theme(theme.into());
                 }
             }
             let adjustment = runtime.widgets.transcript_scroll.vadjustment();
@@ -388,6 +419,7 @@ pub(crate) enum AppEvent {
     VoiceShortcutActivated,
     VoiceShortcutDeactivated,
     TogglePanel,
+    ConfigReloaded,
     ShortcutStatus(ShortcutAction, ShortcutStatus),
 }
 
@@ -546,6 +578,9 @@ struct PanelWidgets {
     link_cancel: gtk::Button,
     link_open: gtk::Button,
     composer_row: gtk::Box,
+    composer_attachments: gtk::Box,
+    composer_attachment_items: gtk::Box,
+    attachment_status: gtk::Label,
     composer_scroll: gtk::ScrolledWindow,
     composer: gtk::TextView,
     composer_placeholder: gtk::Label,
@@ -554,6 +589,15 @@ struct PanelWidgets {
     failure: gtk::Label,
     info: gtk::Label,
     open_settings: gtk::Button,
+    chat_mode: gtk::ToggleButton,
+    agent_mode: gtk::ToggleButton,
+    agent_badge: gtk::Label,
+    folder_chip: gtk::Button,
+    agent_warning: gtk::Box,
+    warning_cancel: gtk::Button,
+    warning_accept: gtk::Button,
+    activities: gtk::Box,
+    question: gtk::Box,
 }
 
 #[derive(Clone)]
@@ -571,7 +615,11 @@ struct PanelRuntime {
     pending_link: Rc<RefCell<Option<String>>>,
     voice: VoiceService,
     pending_voice: Rc<RefCell<PendingVoice>>,
+    attachment_store: Rc<RefCell<AttachmentStore>>,
+    draft_attachments: Rc<RefCell<Vec<DraftAttachment>>>,
+    pending_attachment: Rc<Cell<bool>>,
     output: super::Output,
+    rendered_question_id: Rc<RefCell<Option<AgentRequestId>>>,
 }
 
 #[derive(Default)]
@@ -589,9 +637,8 @@ struct TranscriptScrollState {
 #[derive(Clone)]
 struct RenderedMessage {
     id: String,
-    rendered_text: String,
+    rendered_len: usize,
     rendered_state: MessageState,
-    revision: u64,
     row: gtk::Box,
     label: Option<gtk::Label>,
     document: Option<AssistantDocument>,
@@ -600,6 +647,51 @@ struct RenderedMessage {
 #[derive(Default)]
 struct PendingVoice {
     utterance_id: Option<u64>,
+}
+
+#[derive(Clone)]
+struct DraftAttachment {
+    attachment: ChatAttachment,
+    texture: gdk::Texture,
+}
+
+struct AttachmentStore {
+    directory: tempfile::TempDir,
+    next_id: u64,
+    generation: u64,
+}
+
+impl AttachmentStore {
+    fn new() -> std::io::Result<Self> {
+        Ok(Self {
+            directory: tempfile::Builder::new()
+                .prefix("chathead-ai-images-")
+                .tempdir()?,
+            next_id: 0,
+            generation: 0,
+        })
+    }
+
+    fn reserve(&mut self) -> (u64, String, PathBuf) {
+        self.next_id = self.next_id.saturating_add(1);
+        let id = format!("image-{}", self.next_id);
+        let path = self.directory.path().join(format!("{id}.png"));
+        (self.generation, id, path)
+    }
+
+    fn remove(&self, attachment: &ChatAttachment) {
+        if attachment.path.parent() == Some(self.directory.path()) {
+            let _ = fs::remove_file(&attachment.path);
+        }
+    }
+
+    fn reset(&mut self) -> std::io::Result<()> {
+        let replacement = Self::new()?;
+        self.directory = replacement.directory;
+        self.next_id = 0;
+        self.generation = self.generation.saturating_add(1);
+        Ok(())
+    }
 }
 
 impl PendingVoice {
@@ -699,6 +791,8 @@ pub(crate) fn start_native_overlay(
     });
 
     let panel_widgets = build_panel(&output);
+    let attachment_store = AttachmentStore::new()
+        .map_err(|_| "could not create the private image attachment directory")?;
     let panel_runtime = PanelRuntime {
         widgets: panel_widgets.clone(),
         conversation: Rc::new(RefCell::new(Conversation::default())),
@@ -713,7 +807,11 @@ pub(crate) fn start_native_overlay(
         pending_link: Rc::new(RefCell::new(None)),
         voice: voice.clone(),
         pending_voice: Rc::new(RefCell::new(PendingVoice::default())),
+        attachment_store: Rc::new(RefCell::new(attachment_store)),
+        draft_attachments: Rc::new(RefCell::new(Vec::new())),
+        pending_attachment: Rc::new(Cell::new(false)),
         output: output.clone(),
+        rendered_question_id: Rc::new(RefCell::new(None)),
     };
     apply_panel_metrics(&panel_runtime, current_panel_zoom());
     apply_panel_dimensions(&panel_runtime, current_panel_size());
@@ -860,9 +958,7 @@ fn build_panel(output: &super::Output) -> PanelWidgets {
     header.append(&new_chat);
 
     let message = gtk::Label::builder()
-        .label(format!(
-            "Voice shortcut is registering through the XDG portal. Preferred shortcut: {VOICE_TOGGLE_LABEL}."
-        ))
+        .label("Voice shortcut is registering through the XDG portal.")
         .wrap(true)
         .xalign(0.0)
         .yalign(0.0)
@@ -951,11 +1047,107 @@ fn build_panel(output: &super::Output) -> PanelWidgets {
     link_confirmation.append(&link_cancel);
     link_confirmation.append(&link_open);
 
+    let chat_mode = gtk::ToggleButton::builder()
+        .label("Chat")
+        .active(true)
+        .css_classes(["mode-choice"])
+        .build();
+    let agent_mode = gtk::ToggleButton::builder()
+        .label("Agent")
+        .group(&chat_mode)
+        .css_classes(["mode-choice"])
+        .build();
+    let agent_badge = gtk::Label::builder()
+        .label("Full access · No approvals")
+        .visible(false)
+        .css_classes(["agent-access-badge"])
+        .build();
+    let folder_chip = gtk::Button::builder()
+        .label("Choose folder")
+        .visible(false)
+        .hexpand(true)
+        .halign(gtk::Align::End)
+        .css_classes(["agent-folder-chip"])
+        .build();
+    let mode_row = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(6)
+        .css_classes(["chat-mode-row"])
+        .build();
+    mode_row.append(&chat_mode);
+    mode_row.append(&agent_mode);
+    mode_row.append(&agent_badge);
+    mode_row.append(&folder_chip);
+
+    let warning_text = gtk::Label::builder()
+        .label("Agent can read, edit, delete, run commands, and use the network as your user without approval prompts. Cached or passwordless sudo may allow elevation.")
+        .wrap(true)
+        .xalign(0.0)
+        .hexpand(true)
+        .build();
+    let warning_cancel = gtk::Button::builder().label("Cancel").build();
+    let warning_accept = gtk::Button::builder()
+        .label("I understand · Choose folder")
+        .css_classes(["destructive-action"])
+        .build();
+    let warning_actions = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(8)
+        .halign(gtk::Align::End)
+        .build();
+    warning_actions.append(&warning_cancel);
+    warning_actions.append(&warning_accept);
+    let agent_warning = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(8)
+        .visible(false)
+        .css_classes(["agent-warning"])
+        .build();
+    agent_warning.append(&warning_text);
+    agent_warning.append(&warning_actions);
+
+    let activities = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(6)
+        .visible(false)
+        .css_classes(["agent-timeline"])
+        .build();
+    let question = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(8)
+        .visible(false)
+        .css_classes(["agent-question"])
+        .build();
+
     let composer_row = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(8)
         .css_classes(["composer-bar"])
         .build();
+    let composer_attachment_items = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(8)
+        .css_classes(["composer-attachment-items"])
+        .build();
+    let attachment_scroll = gtk::ScrolledWindow::builder()
+        .hexpand(true)
+        .hscrollbar_policy(gtk::PolicyType::Automatic)
+        .vscrollbar_policy(gtk::PolicyType::Never)
+        .child(&composer_attachment_items)
+        .build();
+    let attachment_status = gtk::Label::builder()
+        .xalign(0.0)
+        .wrap(true)
+        .css_classes(["attachment-status"])
+        .build();
+    let composer_attachments = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(4)
+        .css_classes(["composer-attachments"])
+        .visible(false)
+        .build();
+    composer_attachments.append(&attachment_scroll);
+    composer_attachments.append(&attachment_status);
     let composer = gtk::TextView::builder()
         .wrap_mode(gtk::WrapMode::WordChar)
         .accepts_tab(false)
@@ -988,7 +1180,8 @@ fn build_panel(output: &super::Output) -> PanelWidgets {
     let send = gtk::Button::builder()
         .label("↑")
         .tooltip_text("Send message")
-        .valign(gtk::Align::End)
+        .halign(gtk::Align::End)
+        .valign(gtk::Align::Center)
         .sensitive(false)
         .css_classes(["send-button"])
         .build();
@@ -1000,18 +1193,31 @@ fn build_panel(output: &super::Output) -> PanelWidgets {
     panel.append(&open_settings);
     panel.append(&info);
     panel.append(&transcript_scroll);
+    panel.append(&activities);
     panel.append(&failure_row);
     panel.append(&link_confirmation);
+    panel.append(&composer_attachments);
+    panel.append(&agent_warning);
+    panel.append(&question);
+    panel.append(&mode_row);
     panel.append(&composer_row);
     new_chat.connect_clicked(|_| {
         PANEL_RUNTIME.with(|stored| {
             if let Some(runtime) = stored.borrow().as_ref() {
                 runtime.conversation.borrow_mut().new_chat();
+                runtime.draft_attachments.borrow_mut().clear();
+                runtime.pending_attachment.set(false);
                 runtime.failure.replace(None);
+                if runtime.attachment_store.borrow_mut().reset().is_err() {
+                    runtime.failure.replace(Some(
+                        "Could not reset the private image attachment directory.".to_owned(),
+                    ));
+                }
                 runtime.pending_link.replace(None);
                 runtime.widgets.link_confirmation.set_visible(false);
                 reset_transcript_scroll(runtime);
                 let _ = runtime.codex.send(CodexCommand::NewChat);
+                render_composer_attachments(runtime);
                 render_chat(runtime);
             }
         })
@@ -1029,6 +1235,9 @@ fn build_panel(output: &super::Output) -> PanelWidgets {
         link_cancel,
         link_open,
         composer_row,
+        composer_attachments,
+        composer_attachment_items,
+        attachment_status,
         composer_scroll,
         composer,
         composer_placeholder,
@@ -1037,6 +1246,15 @@ fn build_panel(output: &super::Output) -> PanelWidgets {
         failure,
         info,
         open_settings,
+        chat_mode,
+        agent_mode,
+        agent_badge,
+        folder_chip,
+        agent_warning,
+        warning_cancel,
+        warning_accept,
+        activities,
+        question,
     }
 }
 
@@ -1090,6 +1308,12 @@ fn apply_panel_metrics(runtime: &PanelRuntime, zoom: PanelZoom) {
         .widgets
         .composer_scroll
         .set_max_content_height(metrics.composer_max_height);
+    update_composer_layout(
+        &runtime.widgets.composer_row,
+        &runtime.widgets.composer_scroll,
+        &runtime.widgets.composer,
+        &runtime.widgets.send,
+    );
     runtime.widgets.container.set_size_request(
         i32::from(current_panel_size().width()),
         i32::from(current_panel_size().height()),
@@ -1112,6 +1336,12 @@ fn apply_panel_dimensions(runtime: &PanelRuntime, size: PanelSize) {
         .widgets
         .container
         .set_size_request(i32::from(size.width()), i32::from(size.height()));
+    update_composer_layout(
+        &runtime.widgets.composer_row,
+        &runtime.widgets.composer_scroll,
+        &runtime.widgets.composer,
+        &runtime.widgets.send,
+    );
     for class in ["panel-compact", "panel-standard", "panel-expanded"] {
         runtime.widgets.container.remove_css_class(class);
     }
@@ -1139,6 +1369,46 @@ fn apply_panel_dimensions(runtime: &PanelRuntime, size: PanelSize) {
         }
     }
     runtime.widgets.container.queue_resize();
+}
+
+fn update_composer_layout(
+    composer_row: &gtk::Box,
+    composer_scroll: &gtk::ScrolledWindow,
+    composer: &gtk::TextView,
+    send: &gtk::Button,
+) {
+    let buffer = composer.buffer();
+    let text = buffer.text(&buffer.start_iter(), &buffer.end_iter(), true);
+    let zoom = current_panel_zoom();
+    let metrics = PanelMetrics::for_zoom(zoom);
+    let scale = f64::from(zoom.value()) / 100.0;
+    let composer_chrome = ((22.0 * scale).round() as i32).max(18);
+    let compact_text_width = (i32::from(current_panel_size().width())
+        - (2 * metrics.panel_padding)
+        - metrics.send_target
+        - metrics.row_spacing
+        - composer_chrome)
+        .max(1);
+
+    let layout = composer.create_pango_layout(Some(text.as_str()));
+    layout.set_width(compact_text_width * gtk::pango::SCALE);
+    layout.set_wrap(gtk::pango::WrapMode::WordChar);
+
+    let composer_layout = ComposerLayout::for_visual_lines(layout.line_count());
+    composer_scroll.set_max_content_height(composer_layout.max_content_height(metrics));
+
+    match composer_layout {
+        ComposerLayout::Compact => {
+            composer_row.set_orientation(gtk::Orientation::Horizontal);
+            composer_row.remove_css_class("composer-expanded");
+            send.set_valign(gtk::Align::Center);
+        }
+        ComposerLayout::Expanded => {
+            composer_row.set_orientation(gtk::Orientation::Vertical);
+            composer_row.add_css_class("composer-expanded");
+            send.set_valign(gtk::Align::End);
+        }
+    }
 }
 
 fn panel_bubble_width_chars(size: PanelSize, zoom: PanelZoom) -> i32 {
@@ -1439,7 +1709,209 @@ fn remove_source(source: Option<glib::SourceId>) {
     }
 }
 
+fn agent_acknowledgment_path() -> Option<PathBuf> {
+    let base = env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))?;
+    Some(base.join("chathead-ai").join("agent-full-access-ack"))
+}
+
+fn agent_warning_acknowledged() -> bool {
+    agent_acknowledgment_path().is_some_and(|path| path.is_file())
+}
+
+fn persist_agent_warning_acknowledgment() -> std::io::Result<()> {
+    let path = agent_acknowledgment_path().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "configuration directory unavailable",
+        )
+    })?;
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid acknowledgment path",
+        )
+    })?;
+    fs::create_dir_all(parent)?;
+    fs::write(path, b"acknowledged\n")
+}
+
+fn choose_agent_folder(runtime: &PanelRuntime) {
+    if runtime.conversation.borrow().is_busy() {
+        return;
+    }
+    runtime.widgets.agent_mode.set_sensitive(false);
+    runtime.widgets.chat_mode.set_sensitive(false);
+    runtime.widgets.folder_chip.set_sensitive(false);
+    let (sender, receiver) = std::sync::mpsc::channel::<Result<Option<PathBuf>, String>>();
+    let spawn_result = thread::Builder::new()
+        .name("chathead-folder-chooser".to_owned())
+        .spawn(move || {
+            let result = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| error.to_string())
+                .and_then(|runtime| {
+                    runtime.block_on(async {
+                        let request = SelectedFiles::open_file()
+                            .title("Choose Agent folder")
+                            .accept_label("Use folder")
+                            .directory(true)
+                            .multiple(false)
+                            .send()
+                            .await
+                            .map_err(|error| error.to_string())?;
+                        let Ok(files) = request.response() else {
+                            return Ok(None);
+                        };
+                        let Some(uri) = files.uris().first() else {
+                            return Ok(None);
+                        };
+                        selected_agent_folder(uri.as_str()).map(Some)
+                    })
+                });
+            let _ = sender.send(result);
+        });
+    if spawn_result.is_err() {
+        runtime
+            .failure
+            .replace(Some("Could not start the Agent folder chooser.".to_owned()));
+        render_chat(runtime);
+        return;
+    }
+
+    let runtime_for_result = runtime.clone();
+    glib::timeout_add_local(Duration::from_millis(40), move || {
+        match receiver.try_recv() {
+            Ok(Ok(Some(folder))) => {
+                if !folder.is_dir() || folder.to_str().is_none() {
+                    runtime_for_result.failure.replace(Some(
+                        "The selected Agent folder is no longer valid.".to_owned(),
+                    ));
+                } else if runtime_for_result
+                    .codex
+                    .send(CodexCommand::SwitchMode {
+                        mode: ChatMode::Agent,
+                        folder: Some(folder),
+                    })
+                    .is_err()
+                {
+                    runtime_for_result.failure.replace(Some(
+                        "Codex is unavailable; Agent mode was not activated.".to_owned(),
+                    ));
+                }
+                render_chat(&runtime_for_result);
+                glib::ControlFlow::Break
+            }
+            Ok(Ok(None)) => {
+                render_chat(&runtime_for_result);
+                glib::ControlFlow::Break
+            }
+            Ok(Err(error)) => {
+                runtime_for_result.failure.replace(Some(error));
+                render_chat(&runtime_for_result);
+                glib::ControlFlow::Break
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                runtime_for_result.failure.replace(Some(
+                    "The Agent folder chooser stopped unexpectedly.".to_owned(),
+                ));
+                render_chat(&runtime_for_result);
+                glib::ControlFlow::Break
+            }
+        }
+    });
+}
+
+fn selected_agent_folder(uri: &str) -> Result<PathBuf, String> {
+    let url = url::Url::parse(uri).map_err(|_| "The selected folder URI is invalid.".to_owned())?;
+    let path = url
+        .to_file_path()
+        .map_err(|_| "Agent requires a local folder.".to_owned())?;
+    if path.to_str().is_none() {
+        return Err("Agent folder paths must be valid UTF-8.".to_owned());
+    }
+    if !path.is_dir() {
+        return Err("The selected Agent folder no longer exists.".to_owned());
+    }
+    Ok(path)
+}
+
 fn wire_chat_controls(runtime: &PanelRuntime) {
+    let runtime_for_agent = runtime.clone();
+    runtime.widgets.agent_mode.connect_clicked(move |_| {
+        if runtime_for_agent.conversation.borrow().mode() == ChatMode::Agent {
+            return;
+        }
+        runtime_for_agent.widgets.chat_mode.set_active(true);
+        if runtime_for_agent.conversation.borrow().is_busy() {
+            runtime_for_agent.failure.replace(Some(
+                "Stop the active turn before switching modes.".to_owned(),
+            ));
+            render_chat(&runtime_for_agent);
+        } else if agent_warning_acknowledged() {
+            choose_agent_folder(&runtime_for_agent);
+        } else {
+            runtime_for_agent.widgets.agent_warning.set_visible(true);
+        }
+    });
+
+    let runtime_for_chat = runtime.clone();
+    runtime.widgets.chat_mode.connect_clicked(move |_| {
+        if runtime_for_chat.conversation.borrow().mode() != ChatMode::Agent {
+            return;
+        }
+        if runtime_for_chat.conversation.borrow().is_busy() {
+            runtime_for_chat.widgets.agent_mode.set_active(true);
+            runtime_for_chat.failure.replace(Some(
+                "Stop the active turn before switching modes.".to_owned(),
+            ));
+            render_chat(&runtime_for_chat);
+            return;
+        }
+        let _ = runtime_for_chat.codex.send(CodexCommand::SwitchMode {
+            mode: ChatMode::Chat,
+            folder: None,
+        });
+        runtime_for_chat.widgets.agent_mode.set_sensitive(false);
+        runtime_for_chat.widgets.chat_mode.set_sensitive(false);
+    });
+
+    let runtime_for_warning_cancel = runtime.clone();
+    runtime.widgets.warning_cancel.connect_clicked(move |_| {
+        runtime_for_warning_cancel
+            .widgets
+            .agent_warning
+            .set_visible(false);
+        runtime_for_warning_cancel
+            .widgets
+            .chat_mode
+            .set_active(true);
+    });
+    let runtime_for_warning_accept = runtime.clone();
+    runtime.widgets.warning_accept.connect_clicked(move |_| {
+        if persist_agent_warning_acknowledgment().is_err() {
+            runtime_for_warning_accept.failure.replace(Some(
+                "Could not save the Agent full-access acknowledgment.".to_owned(),
+            ));
+            render_chat(&runtime_for_warning_accept);
+            return;
+        }
+        runtime_for_warning_accept
+            .widgets
+            .agent_warning
+            .set_visible(false);
+        choose_agent_folder(&runtime_for_warning_accept);
+    });
+    let runtime_for_folder = runtime.clone();
+    runtime.widgets.folder_chip.connect_clicked(move |_| {
+        if !runtime_for_folder.conversation.borrow().is_busy() {
+            choose_agent_folder(&runtime_for_folder);
+        }
+    });
+
     let runtime_for_send = runtime.clone();
     runtime.widgets.send.connect_clicked(move |_| {
         if runtime_for_send.conversation.borrow().is_busy() {
@@ -1455,9 +1927,9 @@ fn wire_chat_controls(runtime: &PanelRuntime) {
             .conversation
             .borrow()
             .last_prompt()
-            .map(str::to_owned);
+            .cloned();
         if let Some(prompt) = prompt {
-            submit_text(&runtime_for_retry, &prompt);
+            submit_prompt(&runtime_for_retry, prompt);
         }
     });
 
@@ -1497,6 +1969,23 @@ fn wire_chat_controls(runtime: &PanelRuntime) {
     let key = gtk::EventControllerKey::new();
     let runtime_for_key = runtime.clone();
     key.connect_key_pressed(move |_, key, _, modifiers| {
+        let clipboard_formats = runtime_for_key
+            .widgets
+            .composer
+            .display()
+            .clipboard()
+            .formats();
+        if key == gdk::Key::v
+            && modifiers.contains(gdk::ModifierType::CONTROL_MASK)
+            && (clipboard_formats.contains_type(gdk::Texture::static_type())
+                || clipboard_formats
+                    .mime_types()
+                    .iter()
+                    .any(|mime_type| mime_type.starts_with("image/")))
+        {
+            paste_clipboard_image(&runtime_for_key);
+            return glib::Propagation::Stop;
+        }
         if key == gdk::Key::Return && runtime_for_key.conversation.borrow().is_busy() {
             return glib::Propagation::Stop;
         }
@@ -1511,8 +2000,13 @@ fn wire_chat_controls(runtime: &PanelRuntime) {
 
     let placeholder = runtime.widgets.composer_placeholder.clone();
     let send = runtime.widgets.send.clone();
+    let composer_row = glib::object::ObjectExt::downgrade(&runtime.widgets.composer_row);
+    let composer_scroll = glib::object::ObjectExt::downgrade(&runtime.widgets.composer_scroll);
+    let composer = glib::object::ObjectExt::downgrade(&runtime.widgets.composer);
     let chat_state = runtime.chat_state.clone();
     let conversation = runtime.conversation.clone();
+    let draft_attachments = runtime.draft_attachments.clone();
+    let pending_attachment = runtime.pending_attachment.clone();
     runtime
         .widgets
         .composer
@@ -1521,24 +2015,327 @@ fn wire_chat_controls(runtime: &PanelRuntime) {
             let text = buffer.text(&buffer.start_iter(), &buffer.end_iter(), true);
             placeholder.set_visible(text.is_empty());
             let ready = chat_state.get() == ExperimentalChatState::Ready;
-            send.set_sensitive(ready && (conversation.borrow().is_busy() || !text.is_empty()));
+            let has_prompt = !text.trim().is_empty() || !draft_attachments.borrow().is_empty();
+            send.set_sensitive(
+                ready
+                    && (conversation.borrow().is_busy()
+                        || (has_prompt && !pending_attachment.get())),
+            );
+            if let (Some(composer_row), Some(composer_scroll), Some(composer)) = (
+                composer_row.upgrade(),
+                composer_scroll.upgrade(),
+                composer.upgrade(),
+            ) {
+                update_composer_layout(&composer_row, &composer_scroll, &composer, &send);
+            }
         });
+}
+
+fn paste_clipboard_image(runtime: &PanelRuntime) {
+    if runtime.pending_attachment.get() {
+        runtime.failure.replace(Some(
+            "Wait for the current pasted image to finish processing.".to_owned(),
+        ));
+        render_chat(runtime);
+        return;
+    }
+    if runtime.draft_attachments.borrow().len() >= MAX_PROMPT_ATTACHMENTS {
+        runtime.failure.replace(Some(format!(
+            "A prompt can contain at most {MAX_PROMPT_ATTACHMENTS} images."
+        )));
+        render_chat(runtime);
+        return;
+    }
+
+    runtime.pending_attachment.set(true);
+    runtime.failure.replace(None);
+    render_composer_attachments(runtime);
+    render_chat(runtime);
+    let clipboard = runtime.widgets.composer.display().clipboard();
+    let paste_generation = runtime.attachment_store.borrow().generation;
+    let runtime_for_read = runtime.clone();
+    clipboard.read_texture_async(gio::Cancellable::NONE, move |result| {
+        if runtime_for_read.attachment_store.borrow().generation != paste_generation {
+            return;
+        }
+        let texture = match result {
+            Ok(Some(texture)) => texture,
+            Ok(None) => {
+                finish_attachment_error(
+                    &runtime_for_read,
+                    "The clipboard does not contain a readable image.",
+                );
+                return;
+            }
+            Err(_) => {
+                finish_attachment_error(
+                    &runtime_for_read,
+                    "ChatHead could not read the image from the clipboard.",
+                );
+                return;
+            }
+        };
+        let width = texture.width();
+        let height = texture.height();
+        let Ok(width) = u32::try_from(width) else {
+            finish_attachment_error(&runtime_for_read, "The pasted image has an invalid width.");
+            return;
+        };
+        let Ok(height) = u32::try_from(height) else {
+            finish_attachment_error(&runtime_for_read, "The pasted image has an invalid height.");
+            return;
+        };
+        let pixels = u64::from(width).saturating_mul(u64::from(height));
+        if width == 0 || height == 0 || pixels > MAX_IMAGE_PIXELS {
+            finish_attachment_error(
+                &runtime_for_read,
+                "The pasted image exceeds the 25-megapixel limit.",
+            );
+            return;
+        }
+
+        let (generation, id, path) = runtime_for_read.attachment_store.borrow_mut().reserve();
+        let runtime_for_task = runtime_for_read.clone();
+        glib::MainContext::default().spawn_local(async move {
+            let path_for_task = path.clone();
+            let encoded = gio::spawn_blocking(move || {
+                encode_clipboard_texture(texture, id, path_for_task, width, height)
+            })
+            .await;
+            let result = encoded
+                .unwrap_or_else(|_| Err("Image processing stopped unexpectedly.".to_owned()));
+            match result {
+                Ok(attachment) => {
+                    if runtime_for_task.attachment_store.borrow().generation != generation {
+                        let _ = fs::remove_file(&attachment.path);
+                        render_composer_attachments(&runtime_for_task);
+                        render_chat(&runtime_for_task);
+                        return;
+                    }
+                    let existing_bytes = runtime_for_task
+                        .draft_attachments
+                        .borrow()
+                        .iter()
+                        .map(|draft| draft.attachment.byte_len)
+                        .sum::<u64>();
+                    if existing_bytes.saturating_add(attachment.byte_len) > MAX_PROMPT_IMAGE_BYTES {
+                        runtime_for_task
+                            .attachment_store
+                            .borrow()
+                            .remove(&attachment);
+                        finish_attachment_error(
+                            &runtime_for_task,
+                            "The prompt exceeds the 80 MiB combined image limit.",
+                        );
+                        return;
+                    }
+                    match load_texture(&attachment.path) {
+                        Ok(texture) => {
+                            runtime_for_task
+                                .draft_attachments
+                                .borrow_mut()
+                                .push(DraftAttachment {
+                                    attachment,
+                                    texture,
+                                })
+                        }
+                        Err(_) => {
+                            runtime_for_task
+                                .attachment_store
+                                .borrow()
+                                .remove(&attachment);
+                            finish_attachment_error(
+                                &runtime_for_task,
+                                "ChatHead could not preview the sanitized image.",
+                            );
+                            return;
+                        }
+                    }
+                    runtime_for_task.pending_attachment.set(false);
+                    runtime_for_task.failure.replace(None);
+                    render_composer_attachments(&runtime_for_task);
+                    render_chat(&runtime_for_task);
+                }
+                Err(message) => finish_attachment_error(&runtime_for_task, &message),
+            }
+        });
+    });
+}
+
+fn encode_clipboard_texture(
+    texture: gdk::Texture,
+    id: String,
+    path: PathBuf,
+    width: u32,
+    height: u32,
+) -> Result<ChatAttachment, String> {
+    texture
+        .save_to_png(&path)
+        .map_err(|_| "ChatHead could not sanitize the pasted image.".to_owned())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).map_err(|_| {
+            let _ = fs::remove_file(&path);
+            "ChatHead could not secure the pasted image file.".to_owned()
+        })?;
+    }
+    let byte_len = fs::metadata(&path)
+        .map_err(|_| "ChatHead could not inspect the sanitized image.".to_owned())?
+        .len();
+    if byte_len > MAX_IMAGE_BYTES {
+        let _ = fs::remove_file(&path);
+        return Err("The sanitized image exceeds the 20 MiB limit.".to_owned());
+    }
+    Ok(ChatAttachment {
+        id,
+        path,
+        mime_type: "image/png".to_owned(),
+        width,
+        height,
+        byte_len,
+    })
+}
+
+fn finish_attachment_error(runtime: &PanelRuntime, message: &str) {
+    runtime.pending_attachment.set(false);
+    runtime.failure.replace(Some(message.to_owned()));
+    render_composer_attachments(runtime);
+    render_chat(runtime);
+}
+
+fn render_composer_attachments(runtime: &PanelRuntime) {
+    while let Some(child) = runtime.widgets.composer_attachment_items.first_child() {
+        runtime.widgets.composer_attachment_items.remove(&child);
+    }
+    for draft in runtime.draft_attachments.borrow().iter() {
+        let card = gtk::Overlay::builder()
+            .css_classes(["attachment-card"])
+            .build();
+        let picture = gtk::Picture::for_paintable(&draft.texture);
+        picture.set_can_shrink(true);
+        picture.set_keep_aspect_ratio(true);
+        let (width, height) = attachment_preview_size(
+            draft.attachment.width,
+            draft.attachment.height,
+            COMPOSER_ATTACHMENT_MAX_SIZE,
+            COMPOSER_ATTACHMENT_MAX_SIZE,
+        );
+        picture.set_size_request(width, height);
+        picture.set_tooltip_text(Some("Open image preview"));
+        let preview = gtk::GestureClick::new();
+        let texture_for_preview = draft.texture.clone();
+        preview.connect_released(move |_, _, _, _| show_image_preview(&texture_for_preview));
+        picture.add_controller(preview);
+        let remove = gtk::Button::builder()
+            .icon_name("window-close-symbolic")
+            .tooltip_text("Remove pasted image")
+            .halign(gtk::Align::End)
+            .valign(gtk::Align::Start)
+            .css_classes(["attachment-remove"])
+            .build();
+        let attachment_id = draft.attachment.id.clone();
+        let runtime_for_remove = runtime.clone();
+        remove.connect_clicked(move |_| {
+            let removed = {
+                let mut drafts = runtime_for_remove.draft_attachments.borrow_mut();
+                drafts
+                    .iter()
+                    .position(|draft| draft.attachment.id == attachment_id)
+                    .map(|index| drafts.remove(index))
+            };
+            if let Some(removed) = removed {
+                runtime_for_remove
+                    .attachment_store
+                    .borrow()
+                    .remove(&removed.attachment);
+            }
+            render_composer_attachments(&runtime_for_remove);
+            render_chat(&runtime_for_remove);
+        });
+        card.set_child(Some(&picture));
+        card.add_overlay(&remove);
+        runtime.widgets.composer_attachment_items.append(&card);
+    }
+    let pending = runtime.pending_attachment.get();
+    runtime.widgets.attachment_status.set_label(if pending {
+        "Processing pasted image…"
+    } else {
+        ""
+    });
+    runtime.widgets.attachment_status.set_visible(pending);
+    runtime
+        .widgets
+        .composer_attachments
+        .set_visible(pending || !runtime.draft_attachments.borrow().is_empty());
+}
+
+fn attachment_preview_size(width: u32, height: u32, max_width: i32, max_height: i32) -> (i32, i32) {
+    let width = f64::from(width.max(1));
+    let height = f64::from(height.max(1));
+    let scale = (f64::from(max_width) / width)
+        .min(f64::from(max_height) / height)
+        .min(1.0);
+    (
+        (width * scale).round().max(1.0) as i32,
+        (height * scale).round().max(1.0) as i32,
+    )
+}
+
+fn show_image_preview(texture: &gdk::Texture) {
+    let picture = gtk::Picture::for_paintable(texture);
+    picture.set_can_shrink(true);
+    picture.set_keep_aspect_ratio(true);
+    let preview = gtk::Window::builder()
+        .title("Pasted image")
+        .default_width(720)
+        .default_height(540)
+        .modal(false)
+        .child(&picture)
+        .build();
+    preview.present();
+}
+
+fn load_texture(path: &PathBuf) -> Result<gdk::Texture, glib::Error> {
+    gdk::Texture::from_file(&gio::File::for_path(path))
 }
 
 fn submit_composer(runtime: &PanelRuntime) {
     let buffer = runtime.widgets.composer.buffer();
     let text = buffer.text(&buffer.start_iter(), &buffer.end_iter(), true);
-    submit_text(runtime, &text);
+    if runtime.pending_attachment.get() {
+        runtime.failure.replace(Some(
+            "Wait for the pasted image to finish processing before sending.".to_owned(),
+        ));
+        render_chat(runtime);
+        return;
+    }
+    let prompt = ChatPrompt {
+        text: text.to_string(),
+        attachments: runtime
+            .draft_attachments
+            .borrow()
+            .iter()
+            .map(|draft| draft.attachment.clone())
+            .collect(),
+    };
+    submit_prompt(runtime, prompt);
     if runtime.conversation.borrow().is_busy() {
         buffer.set_text("");
+        runtime.draft_attachments.borrow_mut().clear();
+        render_composer_attachments(runtime);
     }
 }
 
 fn submit_text(runtime: &PanelRuntime, text: &str) {
-    if text.trim().is_empty() {
-        runtime
-            .failure
-            .replace(Some("Type a message before sending.".to_owned()));
+    submit_prompt(runtime, ChatPrompt::text(text));
+}
+
+fn submit_prompt(runtime: &PanelRuntime, prompt: ChatPrompt) {
+    if prompt.is_empty() {
+        runtime.failure.replace(Some(
+            "Type a message or paste an image before sending.".to_owned(),
+        ));
         render_chat(runtime);
         runtime.widgets.composer.grab_focus();
         return;
@@ -1550,7 +2347,10 @@ fn submit_text(runtime: &PanelRuntime, text: &str) {
         render_chat(runtime);
         return;
     }
-    let send_result = runtime.conversation.borrow_mut().send(text);
+    let send_result = runtime
+        .conversation
+        .borrow_mut()
+        .send_prompt(prompt.clone());
     let message_id = match send_result {
         Ok(message_id) => message_id,
         Err(error) => {
@@ -1565,7 +2365,7 @@ fn submit_text(runtime: &PanelRuntime, text: &str) {
         .codex
         .send(CodexCommand::SendMessage {
             message_id: message_id.clone(),
-            text: text.trim().to_owned(),
+            prompt,
         })
         .is_err()
     {
@@ -1615,7 +2415,10 @@ pub(crate) fn handle_codex_event(_app: &gtk::Application, event: &CodexEvent) {
         if let CodexEvent::AssistantTextDelta { message_id, .. } = event {
             request_transcript_response_focus(runtime, message_id);
         }
-        if matches!(event, CodexEvent::AssistantTextDelta { .. }) {
+        if matches!(
+            event,
+            CodexEvent::AssistantTextDelta { .. } | CodexEvent::ActivityUpsert(_)
+        ) {
             schedule_stream_render(runtime);
         } else {
             cancel_stream_render(runtime);
@@ -1691,6 +2494,10 @@ fn render_chat(runtime: &PanelRuntime) {
     sync_transcript(runtime, conversation.messages());
 
     let busy = conversation.is_busy();
+    let mode = conversation.mode();
+    let folder = conversation.agent_folder().map(PathBuf::from);
+    let activities = conversation.activities().to_vec();
+    let question = conversation.question().cloned();
     let ready = runtime.chat_state.get() == ExperimentalChatState::Ready;
     runtime.widgets.chat_status.set_label(if busy {
         "● Thinking · ChatGPT"
@@ -1712,6 +2519,34 @@ fn render_chat(runtime: &PanelRuntime) {
     } else {
         "Send message"
     }));
+    runtime.widgets.chat_mode.set_active(mode == ChatMode::Chat);
+    runtime
+        .widgets
+        .agent_mode
+        .set_active(mode == ChatMode::Agent);
+    runtime.widgets.chat_mode.set_sensitive(!busy);
+    runtime.widgets.agent_mode.set_sensitive(!busy);
+    runtime
+        .widgets
+        .agent_badge
+        .set_visible(mode == ChatMode::Agent);
+    runtime
+        .widgets
+        .folder_chip
+        .set_visible(mode == ChatMode::Agent);
+    runtime.widgets.folder_chip.set_sensitive(!busy);
+    if let Some(folder) = folder.as_deref() {
+        runtime.widgets.folder_chip.set_label(
+            folder
+                .file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .unwrap_or("Agent folder"),
+        );
+        runtime
+            .widgets
+            .folder_chip
+            .set_tooltip_text(folder.to_str());
+    }
     runtime.widgets.composer.set_sensitive(ready);
     runtime.widgets.composer.set_editable(ready);
     let composer_buffer = runtime.widgets.composer.buffer();
@@ -1724,10 +2559,13 @@ fn render_chat(runtime: &PanelRuntime) {
         .widgets
         .composer_placeholder
         .set_visible(ready && composer_text.is_empty());
-    runtime
-        .widgets
-        .send
-        .set_sensitive(ready && (busy || !composer_text.is_empty()));
+    runtime.widgets.send.set_sensitive(
+        ready
+            && (busy
+                || ((!composer_text.trim().is_empty()
+                    || !runtime.draft_attachments.borrow().is_empty())
+                    && !runtime.pending_attachment.get())),
+    );
 
     let info = runtime
         .chat_message
@@ -1754,7 +2592,121 @@ fn render_chat(runtime: &PanelRuntime) {
         failure.is_some() && conversation.last_prompt().is_some() && !conversation.is_busy(),
     );
     drop(conversation);
+    render_agent_timeline(runtime, &activities, mode == ChatMode::Agent);
+    render_agent_question(runtime, question.as_ref());
     queue_transcript_anchor(runtime);
+}
+
+fn render_agent_timeline(runtime: &PanelRuntime, activities: &[AgentActivity], visible: bool) {
+    while let Some(child) = runtime.widgets.activities.first_child() {
+        runtime.widgets.activities.remove(&child);
+    }
+    for activity in activities {
+        let detail = gtk::Label::builder()
+            .label(&activity.detail)
+            .wrap(true)
+            .selectable(true)
+            .xalign(0.0)
+            .visible(false)
+            .css_classes(["agent-activity-detail"])
+            .build();
+        let toggle = gtk::ToggleButton::builder()
+            .label(format!("{} · {}", activity.title, activity.status))
+            .halign(gtk::Align::Fill)
+            .css_classes(["agent-activity-header"])
+            .build();
+        let detail_for_toggle = detail.clone();
+        toggle.connect_toggled(move |toggle| detail_for_toggle.set_visible(toggle.is_active()));
+        let card = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(4)
+            .css_classes(["agent-activity-card"])
+            .build();
+        card.append(&toggle);
+        card.append(&detail);
+        runtime.widgets.activities.append(&card);
+    }
+    runtime
+        .widgets
+        .activities
+        .set_visible(visible && !activities.is_empty());
+}
+
+fn render_agent_question(runtime: &PanelRuntime, question: Option<&AgentQuestion>) {
+    let request_id = question.map(|question| question.request_id.clone());
+    if runtime.rendered_question_id.borrow().as_ref() == request_id.as_ref() {
+        return;
+    }
+    while let Some(child) = runtime.widgets.question.first_child() {
+        runtime.widgets.question.remove(&child);
+    }
+    runtime.rendered_question_id.replace(request_id);
+    let Some(question) = question else {
+        runtime.widgets.question.set_visible(false);
+        return;
+    };
+
+    let mut entries = Vec::with_capacity(question.fields.len());
+    for field in &question.fields {
+        let header = gtk::Label::builder()
+            .label(format!("{} · {}", field.header, field.question))
+            .wrap(true)
+            .xalign(0.0)
+            .build();
+        runtime.widgets.question.append(&header);
+        let entry = gtk::Entry::builder()
+            .placeholder_text(if field.allow_other {
+                "Choose or type an answer"
+            } else {
+                "Choose an answer"
+            })
+            .visibility(!field.secret)
+            .build();
+        entry.set_editable(field.allow_other || field.options.is_empty());
+        let options = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(6)
+            .build();
+        for option in &field.options {
+            let button = gtk::Button::builder()
+                .label(&option.label)
+                .tooltip_text(&option.description)
+                .build();
+            let entry_for_option = entry.clone();
+            let answer = option.label.clone();
+            button.connect_clicked(move |_| entry_for_option.set_text(&answer));
+            options.append(&button);
+        }
+        runtime.widgets.question.append(&options);
+        runtime.widgets.question.append(&entry);
+        entries.push((field.id.clone(), entry));
+    }
+    let submit = gtk::Button::builder()
+        .label("Submit answers")
+        .css_classes(["suggested-action"])
+        .halign(gtk::Align::End)
+        .build();
+    let runtime_for_submit = runtime.clone();
+    let request_id = question.request_id.clone();
+    submit.connect_clicked(move |_| {
+        let answers = entries
+            .iter()
+            .map(|(id, entry)| (id.clone(), vec![entry.text().to_string()]))
+            .collect::<BTreeMap<_, _>>();
+        if answers.values().any(|answers| answers[0].trim().is_empty()) {
+            runtime_for_submit.failure.replace(Some(
+                "Answer every Agent question before continuing.".to_owned(),
+            ));
+            render_chat(&runtime_for_submit);
+            return;
+        }
+        let _ = runtime_for_submit.codex.send(CodexCommand::AnswerQuestion {
+            request_id: request_id.clone(),
+            answers,
+        });
+    });
+    runtime.widgets.question.append(&submit);
+    runtime.widgets.question.set_visible(true);
 }
 
 fn sync_transcript(runtime: &PanelRuntime, messages: &[ChatMessage]) {
@@ -1779,7 +2731,7 @@ fn sync_transcript(runtime: &PanelRuntime, messages: &[ChatMessage]) {
     }
 
     for (widget, message) in rendered.iter_mut().zip(messages) {
-        if widget.rendered_text == message.text && widget.rendered_state == message.state {
+        if widget.rendered_len == message.text.len() && widget.rendered_state == message.state {
             continue;
         }
 
@@ -1803,9 +2755,8 @@ fn sync_transcript(runtime: &PanelRuntime, messages: &[ChatMessage]) {
                 }
             }
         }
-        widget.rendered_text.clone_from(&message.text);
+        widget.rendered_len = message.text.len();
         widget.rendered_state = message.state;
-        widget.revision = widget.revision.saturating_add(1);
     }
 }
 
@@ -1821,9 +2772,8 @@ fn message_widget(message: &ChatMessage, worker: &HighlightWorker) -> RenderedMe
         row.append(&thinking_bubble());
         return RenderedMessage {
             id: message.id.clone(),
-            rendered_text: String::new(),
+            rendered_len: 0,
             rendered_state: message.state,
-            revision: 0,
             row,
             label: None,
             document: None,
@@ -1836,9 +2786,8 @@ fn message_widget(message: &ChatMessage, worker: &HighlightWorker) -> RenderedMe
             row.append(&user_message_widget(message, &label));
             RenderedMessage {
                 id: message.id.clone(),
-                rendered_text: message.text.clone(),
+                rendered_len: message.text.len(),
                 rendered_state: message.state,
-                revision: 1,
                 row,
                 label: Some(label),
                 document: None,
@@ -1849,9 +2798,8 @@ fn message_widget(message: &ChatMessage, worker: &HighlightWorker) -> RenderedMe
             row.append(&document.widget());
             RenderedMessage {
                 id: message.id.clone(),
-                rendered_text: message.text.clone(),
+                rendered_len: message.text.len(),
                 rendered_state: message.state,
-                revision: 1,
                 row,
                 label: None,
                 document: Some(document),
@@ -1862,7 +2810,7 @@ fn message_widget(message: &ChatMessage, worker: &HighlightWorker) -> RenderedMe
 
 fn user_message_label(message: &ChatMessage) -> gtk::Label {
     let max_width_chars = panel_bubble_width_chars(current_panel_size(), current_panel_zoom());
-    gtk::Label::builder()
+    let label = gtk::Label::builder()
         .label(&message.text)
         .wrap(true)
         .wrap_mode(gtk::pango::WrapMode::WordChar)
@@ -1870,7 +2818,9 @@ fn user_message_label(message: &ChatMessage) -> gtk::Label {
         .xalign(0.0)
         .max_width_chars(max_width_chars)
         .css_classes(["chat-bubble", "user-bubble"])
-        .build()
+        .build();
+    label.set_visible(!message.text.is_empty());
+    label
 }
 
 fn user_message_widget(message: &ChatMessage, label: &gtk::Label) -> gtk::Box {
@@ -1885,6 +2835,45 @@ fn user_message_widget(message: &ChatMessage, label: &gtk::Label) -> gtk::Box {
         .halign(gtk::Align::End)
         .css_classes(["user-message-actions"])
         .build();
+    if !message.attachments.is_empty() {
+        let images = gtk::FlowBox::builder()
+            .selection_mode(gtk::SelectionMode::None)
+            .max_children_per_line(3)
+            .row_spacing(6)
+            .column_spacing(6)
+            .halign(gtk::Align::End)
+            .css_classes(["user-attachments"])
+            .build();
+        for attachment in &message.attachments {
+            let child: gtk::Widget = match load_texture(&attachment.path) {
+                Ok(texture) => {
+                    let picture = gtk::Picture::for_paintable(&texture);
+                    picture.set_can_shrink(true);
+                    picture.set_keep_aspect_ratio(true);
+                    let (width, height) = attachment_preview_size(
+                        attachment.width,
+                        attachment.height,
+                        TRANSCRIPT_ATTACHMENT_MAX_WIDTH,
+                        TRANSCRIPT_ATTACHMENT_MAX_HEIGHT,
+                    );
+                    picture.set_size_request(width, height);
+                    picture.set_halign(gtk::Align::End);
+                    picture.set_tooltip_text(Some("Open submitted image"));
+                    let preview = gtk::GestureClick::new();
+                    preview.connect_released(move |_, _, _, _| show_image_preview(&texture));
+                    picture.add_controller(preview);
+                    picture.upcast()
+                }
+                Err(_) => gtk::Label::builder()
+                    .label("Image preview unavailable")
+                    .css_classes(["attachment-unavailable"])
+                    .build()
+                    .upcast(),
+            };
+            images.insert(&child, -1);
+        }
+        container.append(&images);
+    }
     let copy = gtk::Button::builder()
         .icon_name("edit-copy-symbolic")
         .tooltip_text("Copy prompt")
@@ -1892,6 +2881,7 @@ fn user_message_widget(message: &ChatMessage, label: &gtk::Label) -> gtk::Box {
         .css_classes(["response-action", "user-copy-action"])
         .build();
     let prompt = message.text.clone();
+    copy.set_sensitive(!prompt.is_empty());
     copy.connect_clicked(move |button| copy_text_to_clipboard(button, &prompt));
     actions.append(&copy);
     container.append(label);
@@ -1925,10 +2915,9 @@ fn retry_assistant_response(assistant_message_id: &str) {
         let prompt = runtime
             .conversation
             .borrow()
-            .prompt_for_assistant(assistant_message_id)
-            .map(str::to_owned);
+            .prompt_for_assistant(assistant_message_id);
         if let Some(prompt) = prompt {
-            submit_text(runtime, &prompt);
+            submit_prompt(runtime, prompt);
         }
     });
 }
@@ -2046,6 +3035,7 @@ fn handle_app_event(
             });
         }
         AppEvent::TogglePanel => toggle_panel(),
+        AppEvent::ConfigReloaded => {}
         AppEvent::ShortcutStatus(action, shortcut_status) => {
             let protocol_status = match &shortcut_status {
                 ShortcutStatus::Registering => ProtocolShortcutStatus::Registering,
@@ -2108,6 +3098,7 @@ pub(crate) fn handle_global_app_event(event: &AppEvent) {
             });
         }
         AppEvent::TogglePanel => toggle_panel(),
+        AppEvent::ConfigReloaded => {}
         AppEvent::ShortcutStatus(_, _) => {}
     }
 }
@@ -2819,7 +3810,32 @@ fn focus_composer_when_mapped(composer: &gtk::TextView) {
     });
 }
 
-pub(crate) fn start_shortcut_service(sender: mpsc::Sender<AppEvent>) {
+#[derive(Clone)]
+pub(crate) struct ShortcutService {
+    commands:
+        tokio::sync::mpsc::UnboundedSender<(Vec<CoreShortcutAction>, Option<ShortcutBackend>)>,
+}
+
+impl ShortcutService {
+    pub(crate) fn configure(
+        &self,
+        actions: Vec<CoreShortcutAction>,
+        backend: Option<ShortcutBackend>,
+    ) {
+        let _ = self.commands.send((actions, backend));
+    }
+}
+
+pub(crate) fn start_shortcut_service(
+    sender: mpsc::Sender<AppEvent>,
+    actions: Vec<CoreShortcutAction>,
+    backend: Option<ShortcutBackend>,
+) -> ShortcutService {
+    let (command_sender, command_receiver) = tokio::sync::mpsc::unbounded_channel();
+    let service = ShortcutService {
+        commands: command_sender,
+    };
+    service.configure(actions, backend);
     if let Err(error) = thread::Builder::new()
         .name("chathead-shortcuts".to_owned())
         .spawn(move || {
@@ -2828,7 +3844,7 @@ pub(crate) fn start_shortcut_service(sender: mpsc::Sender<AppEvent>) {
                 .build();
 
             match runtime {
-                Ok(runtime) => runtime.block_on(run_shortcut_service(sender)),
+                Ok(runtime) => runtime.block_on(run_shortcut_service(sender, command_receiver)),
                 Err(error) => {
                     send_all_shortcut_statuses(
                         &sender,
@@ -2842,19 +3858,47 @@ pub(crate) fn start_shortcut_service(sender: mpsc::Sender<AppEvent>) {
     {
         eprintln!("failed to start shortcut service: {error}");
     }
+    service
 }
 
-async fn run_shortcut_service(sender: mpsc::Sender<AppEvent>) {
-    if !send_all_shortcut_statuses(&sender, ShortcutStatus::Registering) {
-        return;
-    }
-
-    let result = register_and_listen_for_shortcuts(sender.clone()).await;
-    if let Err(error) = result {
-        send_all_shortcut_statuses(
-            &sender,
-            ShortcutStatus::Unavailable(format!("Global shortcut unavailable: {error}.")),
-        );
+async fn run_shortcut_service(
+    sender: mpsc::Sender<AppEvent>,
+    mut commands: tokio::sync::mpsc::UnboundedReceiver<(
+        Vec<CoreShortcutAction>,
+        Option<ShortcutBackend>,
+    )>,
+) {
+    let mut active: Option<tokio::task::JoinHandle<()>> = None;
+    while let Some((actions, backend)) = commands.recv().await {
+        if let Some(task) = active.take() {
+            task.abort();
+        }
+        let Some(backend) = backend else { continue };
+        if actions.is_empty() {
+            continue;
+        }
+        let task_sender = sender.clone();
+        active = Some(tokio::spawn(async move {
+            loop {
+                let result = match backend {
+                    ShortcutBackend::HyprlandPortal => {
+                        register_and_listen_for_shortcuts(task_sender.clone(), &actions).await
+                    }
+                    ShortcutBackend::HyprlandEvent => {
+                        listen_for_hyprland_events(&task_sender).await
+                    }
+                };
+                if let Err(error) = result {
+                    send_all_shortcut_statuses(
+                        &task_sender,
+                        ShortcutStatus::Unavailable(format!(
+                            "Global shortcut unavailable: {error}."
+                        )),
+                    );
+                }
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        }));
     }
 }
 
@@ -2870,38 +3914,51 @@ fn send_all_shortcut_statuses(sender: &mpsc::Sender<AppEvent>, status: ShortcutS
 
 async fn register_and_listen_for_shortcuts(
     sender: mpsc::Sender<AppEvent>,
-) -> Result<(), ashpd::Error> {
-    let portal = GlobalShortcuts::new().await?;
+    actions: &[CoreShortcutAction],
+) -> Result<(), String> {
+    let portal = GlobalShortcuts::new()
+        .await
+        .map_err(|error| error.to_string())?;
     let session = portal
         .create_session(CreateSessionOptions::default())
-        .await?;
-    let activated = portal.receive_activated().await?;
-    let deactivated = portal.receive_deactivated().await?;
-    let shortcuts = [
-        NewShortcut::new(VOICE_TOGGLE_ID, "Start or stop local voice input")
-            .preferred_trigger(Some(VOICE_TOGGLE_TRIGGER)),
-        NewShortcut::new(PANEL_TOGGLE_ID, "Toggle the chat panel")
-            .preferred_trigger(Some(PANEL_TOGGLE_TRIGGER)),
-    ];
+        .await
+        .map_err(|error| error.to_string())?;
+    let activated = portal
+        .receive_activated()
+        .await
+        .map_err(|error| error.to_string())?;
+    let deactivated = portal
+        .receive_deactivated()
+        .await
+        .map_err(|error| error.to_string())?;
+    let shortcuts: Vec<_> = actions
+        .iter()
+        .map(|action| match action {
+            CoreShortcutAction::VoiceInput => {
+                NewShortcut::new(VOICE_TOGGLE_ID, "Start or stop local voice input")
+            }
+            CoreShortcutAction::TogglePanel => {
+                NewShortcut::new(PANEL_TOGGLE_ID, "Toggle the chat panel")
+            }
+        })
+        .collect();
 
     let request = portal
         .bind_shortcuts(&session, &shortcuts, None, BindShortcutsOptions::default())
-        .await?;
-    let response = request.response()?;
-    for (action, id, fallback_label, action_label) in [
-        (
-            ShortcutAction::Voice,
-            VOICE_TOGGLE_ID,
-            VOICE_TOGGLE_LABEL,
-            "voice shortcut",
-        ),
-        (
-            ShortcutAction::Panel,
-            PANEL_TOGGLE_ID,
-            PANEL_TOGGLE_LABEL,
-            "panel shortcut",
-        ),
-    ] {
+        .await
+        .map_err(|error| error.to_string())?;
+    let response = request.response().map_err(|error| error.to_string())?;
+    for (action, id, action_label) in [
+        (ShortcutAction::Voice, VOICE_TOGGLE_ID, "voice shortcut"),
+        (ShortcutAction::Panel, PANEL_TOGGLE_ID, "panel shortcut"),
+    ]
+    .into_iter()
+    .filter(|(action, _, _)| {
+        actions.contains(&match action {
+            ShortcutAction::Voice => CoreShortcutAction::VoiceInput,
+            ShortcutAction::Panel => CoreShortcutAction::TogglePanel,
+        })
+    }) {
         let status = response
             .shortcuts()
             .iter()
@@ -2914,11 +3971,7 @@ async fn register_and_listen_for_shortcuts(
                 },
                 |shortcut| {
                     let trigger = shortcut.trigger_description().trim();
-                    ShortcutStatus::Ready(if trigger.is_empty() {
-                        fallback_label.to_owned()
-                    } else {
-                        trigger.to_owned()
-                    })
+                    ShortcutStatus::Ready(if trigger.is_empty() { "Configured in Hyprland".to_owned() } else { trigger.to_owned() })
                 },
             );
         if sender
@@ -2931,7 +3984,8 @@ async fn register_and_listen_for_shortcuts(
 
     let activated = activated.fuse();
     let deactivated = deactivated.fuse();
-    futures_util::pin_mut!(activated, deactivated);
+    let config_events = listen_for_hyprland_events(&sender).fuse();
+    futures_util::pin_mut!(activated, deactivated, config_events);
     loop {
         futures_util::select! {
             event = activated.next() => {
@@ -2958,9 +4012,41 @@ async fn register_and_listen_for_shortcuts(
                     break;
                 }
             },
+            _ = config_events => break,
         }
     }
 
+    Ok(())
+}
+
+async fn listen_for_hyprland_events(sender: &mpsc::Sender<AppEvent>) -> Result<(), String> {
+    let runtime =
+        env::var("XDG_RUNTIME_DIR").map_err(|_| "XDG_RUNTIME_DIR is missing".to_owned())?;
+    let signature = env::var("HYPRLAND_INSTANCE_SIGNATURE")
+        .map_err(|_| "Hyprland instance signature is missing".to_owned())?;
+    if signature.contains('/') || signature.chars().any(char::is_control) {
+        return Err("Hyprland instance signature is invalid".to_owned());
+    }
+    let path = std::path::Path::new(&runtime)
+        .join("hypr")
+        .join(signature)
+        .join(".socket2.sock");
+    let stream = tokio::net::UnixStream::connect(&path)
+        .await
+        .map_err(|error| format!("Could not connect to {}: {error}", path.display()))?;
+    let mut lines = AsyncBufReader::new(stream).lines();
+    while let Some(line) = lines.next_line().await.map_err(|error| error.to_string())? {
+        let event = match line.as_str() {
+            "custom>>chathead:toggle-panel" => Some(AppEvent::TogglePanel),
+            "custom>>chathead:voice-pressed" => Some(AppEvent::VoiceShortcutActivated),
+            "custom>>chathead:voice-released" => Some(AppEvent::VoiceShortcutDeactivated),
+            "configreloaded>>" => Some(AppEvent::ConfigReloaded),
+            _ => None,
+        };
+        if event.is_some_and(|event| sender.send(event).is_err()) {
+            break;
+        }
+    }
     Ok(())
 }
 
@@ -3424,6 +4510,43 @@ mod tests {
     use super::*;
 
     #[test]
+    fn agent_folder_selection_accepts_only_existing_local_directories() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let uri = url::Url::from_directory_path(directory.path()).expect("file URI");
+        assert_eq!(
+            selected_agent_folder(uri.as_str()).expect("valid folder"),
+            directory.path()
+        );
+        assert!(selected_agent_folder("https://example.com/project").is_err());
+        let deleted = directory.path().join("deleted");
+        let deleted_uri = url::Url::from_directory_path(&deleted).expect("deleted URI");
+        assert!(selected_agent_folder(deleted_uri.as_str()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_folder_selection_rejects_non_utf8_paths() {
+        use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+
+        let directory = tempfile::tempdir().expect("temp directory");
+        let path = directory.path().join(OsString::from_vec(vec![b'x', 0xff]));
+        fs::create_dir(&path).expect("non UTF-8 directory");
+        let uri = url::Url::from_directory_path(&path).expect("file URI");
+        assert!(selected_agent_folder(uri.as_str()).is_err());
+    }
+
+    #[test]
+    fn attachment_preview_preserves_landscape_and_portrait_geometry() {
+        assert_eq!(attachment_preview_size(1_920, 1_080, 320, 240), (320, 180));
+        assert_eq!(attachment_preview_size(1_080, 1_920, 320, 240), (135, 240));
+    }
+
+    #[test]
+    fn attachment_preview_does_not_upscale_small_images() {
+        assert_eq!(attachment_preview_size(80, 60, 320, 240), (80, 60));
+    }
+
+    #[test]
     fn panel_stays_within_output_edges() {
         let state = OverlayState::new();
         state.x.set(1900.0);
@@ -3543,6 +4666,21 @@ mod tests {
     }
 
     #[test]
+    fn composer_stacks_controls_only_after_text_wraps() {
+        let metrics = PanelMetrics::for_zoom(PanelZoom::default());
+        let empty = ComposerLayout::for_visual_lines(0);
+        let single_line = ComposerLayout::for_visual_lines(1);
+        let wrapped = ComposerLayout::for_visual_lines(2);
+
+        assert_eq!(empty, ComposerLayout::Compact);
+        assert_eq!(single_line, ComposerLayout::Compact);
+        assert_eq!(wrapped, ComposerLayout::Expanded);
+        assert_eq!(empty.max_content_height(metrics), 42);
+        assert_eq!(single_line.max_content_height(metrics), 42);
+        assert_eq!(wrapped.max_content_height(metrics), 120);
+    }
+
+    #[test]
     fn transcript_scroll_step_moves_partway_without_overshooting() {
         assert_eq!(transcript_scroll_step(0.0, 100.0, 0.3), 30.0);
         assert_eq!(transcript_scroll_step(100.0, 0.0, 0.3), 70.0);
@@ -3556,7 +4694,7 @@ mod tests {
 
     #[test]
     fn panel_size_caps_follow_output_and_preserve_tiny_output_minimums() {
-        let maximum = PanelSize::try_new(960, 800).expect("maximum size");
+        let maximum = PanelSize::try_new(1600, 850).expect("maximum size");
         assert_eq!(effective_panel_size(maximum, 1920, 1080), maximum);
         assert_eq!(
             effective_panel_size(maximum, 800, 600),
@@ -3619,7 +4757,7 @@ mod tests {
 
         let maximum =
             resized_panel_rect(start, ResizeEdge::SouthEast, 2_000.0, 2_000.0, 1920, 1080);
-        assert_eq!((maximum.width, maximum.height), (960, 800));
+        assert_eq!((maximum.width, maximum.height), (1600, 850));
         assert!(maximum.x + f64::from(maximum.width) <= f64::from(1920 - EDGE_PADDING));
         assert!(maximum.y + f64::from(maximum.height) <= f64::from(1080 - EDGE_PADDING));
     }

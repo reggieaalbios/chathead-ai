@@ -1,5 +1,7 @@
 use std::{
+    cell::RefCell,
     io::{self, BufRead, BufReader, BufWriter, Write},
+    rc::Rc,
     sync::{Arc, Mutex, mpsc},
     thread,
     time::Duration,
@@ -9,7 +11,7 @@ use chathead_core::{
     Backend, BackendSnapshot, CodexAppServer, CodexCommand, CodexEvent, DesktopIntegrationKind,
     DesktopIntegrationSnapshot, DesktopIntegrationStatus, ErrorCode, IpcError, IpcEvent,
     IpcRequest, IpcResponse, LaunchBlocker, PROTOCOL_VERSION, PanelSize, PanelZoom, ProviderId,
-    VoiceInteractionMode, VoiceModelId, VoiceSubmissionMode,
+    ShortcutAction, VoiceInteractionMode, VoiceModelId, VoiceSubmissionMode,
 };
 use chathead_voice::{VoiceEvent, VoiceService};
 use gtk::{gio, glib, prelude::*};
@@ -21,6 +23,7 @@ mod overlay;
 mod presentation;
 mod response_format;
 mod response_view;
+mod shortcut_integration;
 
 const APP_ID: &str = "io.github.chathead_ai.ChatHead.Sidecar";
 const IPC_POLL_MS: u64 = 20;
@@ -98,6 +101,12 @@ struct VoiceModelParams {
     model_id: VoiceModelId,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ShortcutActionParams {
+    action: ShortcutAction,
+}
+
 type Output = Arc<Mutex<BufWriter<io::Stdout>>>;
 
 fn main() -> glib::ExitCode {
@@ -114,8 +123,11 @@ fn start_sidecar(app: &gtk::Application) {
     let application_hold = app.hold();
 
     let backend = Arc::new(Mutex::new(Backend::new()));
+    let shortcuts = Rc::new(RefCell::new(shortcut_integration::ShortcutManager::load()));
     if let Ok(mut state) = backend.lock() {
         state.set_desktop_integration(desktop_integration::detect());
+        state.set_shortcut_actions(shortcuts.borrow().states());
+        state.set_shortcut_integration(shortcuts.borrow().integration());
     }
     let voice = VoiceService::start();
     if let Ok(mut state) = backend.lock() {
@@ -128,7 +140,11 @@ fn start_sidecar(app: &gtk::Application) {
     let (global_shortcut_sender, global_shortcut_receiver) = mpsc::channel();
     presentation::export(app);
     watch_gnome_readiness(&backend, &output);
-    overlay::start_shortcut_service(global_shortcut_sender);
+    let shortcut_service = overlay::start_shortcut_service(
+        global_shortcut_sender,
+        shortcuts.borrow().configured_actions(),
+        shortcuts.borrow().integration().backend,
+    );
     start_stdin_reader(sender);
 
     if let Ok(state) = backend.lock() {
@@ -153,7 +169,11 @@ fn start_sidecar(app: &gtk::Application) {
                     &codex,
                     &voice,
                     &output,
-                    &shortcut_status_sender,
+                    ShortcutRuntime {
+                        status_sender: &shortcut_status_sender,
+                        manager: &shortcuts,
+                        service: &shortcut_service,
+                    },
                     request,
                 ),
                 Input::Malformed(message) => write_message(
@@ -181,32 +201,33 @@ fn start_sidecar(app: &gtk::Application) {
         while let Some(event) = voice.try_recv() {
             handle_voice_event(&app, &backend, &output, event);
         }
-        while let Ok(shortcut_status) = shortcut_status_receiver.try_recv() {
-            if let Ok(mut state) = backend.lock() {
-                match shortcut_status.action {
-                    overlay::ShortcutAction::Voice => {
-                        state.set_shortcut_status(shortcut_status.status);
-                    }
-                    overlay::ShortcutAction::Panel => {
-                        state.set_panel_shortcut_status(shortcut_status.status);
-                    }
-                }
-                write_snapshot_changed(&output, state.snapshot());
-            }
-        }
+        while shortcut_status_receiver.try_recv().is_ok() {}
         while let Ok(event) = global_shortcut_receiver.try_recv() {
-            if let Some(shortcut_status) = event.shortcut_status_update()
-                && let Ok(mut state) = backend.lock()
+            if matches!(event, overlay::AppEvent::ConfigReloaded) {
+                shortcuts.borrow_mut().audit_effective_bindings();
+                publish_shortcuts(&backend, &shortcuts, &output);
+            }
+            if matches!(event, overlay::AppEvent::TogglePanel)
+                && backend
+                    .lock()
+                    .is_ok_and(|state| !state.snapshot().overlay_running)
+                && let Err(error) = launch_overlay(
+                    &app,
+                    &backend,
+                    &codex,
+                    &voice,
+                    &output,
+                    &shortcut_status_sender,
+                )
             {
-                match shortcut_status.action {
-                    overlay::ShortcutAction::Voice => {
-                        state.set_shortcut_status(shortcut_status.status);
-                    }
-                    overlay::ShortcutAction::Panel => {
-                        state.set_panel_shortcut_status(shortcut_status.status);
-                    }
-                }
-                write_snapshot_changed(&output, state.snapshot());
+                write_message(
+                    &output,
+                    &IpcEvent {
+                        protocol_version: PROTOCOL_VERSION,
+                        event: "openSettings",
+                        payload: json!({ "message": error.message }),
+                    },
+                );
             }
             overlay::handle_global_app_event(&event);
             presentation::handle_global_app_event(&event);
@@ -281,15 +302,24 @@ fn start_stdin_reader(sender: mpsc::Sender<Input>) {
     }
 }
 
+struct ShortcutRuntime<'a> {
+    status_sender: &'a mpsc::Sender<overlay::ShortcutStatusUpdate>,
+    manager: &'a Rc<RefCell<shortcut_integration::ShortcutManager>>,
+    service: &'a overlay::ShortcutService,
+}
+
 fn handle_request(
     app: &gtk::Application,
     backend: &Arc<Mutex<Backend>>,
     codex: &CodexAppServer,
     voice: &VoiceService,
     output: &Output,
-    shortcut_status_sender: &mpsc::Sender<overlay::ShortcutStatusUpdate>,
+    shortcuts: ShortcutRuntime<'_>,
     request: IpcRequest,
 ) {
+    let shortcut_status_sender = shortcuts.status_sender;
+    let shortcut_service = shortcuts.service;
+    let shortcuts = shortcuts.manager;
     if request.protocol_version != PROTOCOL_VERSION {
         write_error(
             output,
@@ -306,219 +336,317 @@ fn handle_request(
 
     let id = request.id;
     let publish_response_snapshot = publishes_response_snapshot(&request.method);
-    let result =
-        match request.method.as_str() {
-            "getSnapshot" => backend
+    let result = match request.method.as_str() {
+        "getSnapshot" => backend
+            .lock()
+            .map(|state| state.snapshot())
+            .map_err(lock_error),
+        "saveApiKey" => parse::<SaveApiKeyParams>(request.params).and_then(|params| {
+            backend
+                .lock()
+                .map_err(lock_error)?
+                .save_api_key(params.provider_id, &params.api_key)
+                .map_err(IpcError::from)?;
+            backend
                 .lock()
                 .map(|state| state.snapshot())
-                .map_err(lock_error),
-            "saveApiKey" => parse::<SaveApiKeyParams>(request.params).and_then(|params| {
-                backend
-                    .lock()
-                    .map_err(lock_error)?
-                    .save_api_key(params.provider_id, &params.api_key)
-                    .map_err(IpcError::from)?;
-                backend
-                    .lock()
-                    .map(|state| state.snapshot())
-                    .map_err(lock_error)
-            }),
-            "connectSubscription" => parse::<ProviderParams>(request.params).and_then(|params| {
-                backend
-                    .lock()
-                    .map_err(lock_error)?
-                    .begin_subscription_login(params.provider_id)
-                    .map_err(IpcError::from)?;
-                codex.send(CodexCommand::Login).map_err(codex_error)?;
-                backend
-                    .lock()
-                    .map(|state| state.snapshot())
-                    .map_err(lock_error)
-            }),
-            "disconnectProvider" => parse::<ProviderParams>(request.params).and_then(|params| {
-                let subscription_logout = backend
-                    .lock()
-                    .map_err(lock_error)?
-                    .snapshot()
-                    .providers
-                    .into_iter()
-                    .find(|provider| provider.id == params.provider_id)
-                    .is_some_and(|provider| {
-                        matches!(
-                            provider.status,
-                            chathead_core::ProviderStatus::Authenticated {
-                                method: chathead_core::AuthMethod::SubscriptionLogin
-                            }
-                        )
-                    });
-                backend
-                    .lock()
-                    .map_err(lock_error)?
-                    .disconnect_provider(params.provider_id)
-                    .map_err(IpcError::from)?;
-                if subscription_logout {
-                    codex.send(CodexCommand::Logout).map_err(codex_error)?;
-                }
-                backend
-                    .lock()
-                    .map(|state| state.snapshot())
-                    .map_err(lock_error)
-            }),
-            "launchOverlay" => {
-                launch_overlay(app, backend, codex, voice, output, shortcut_status_sender)
+                .map_err(lock_error)
+        }),
+        "connectSubscription" => parse::<ProviderParams>(request.params).and_then(|params| {
+            backend
+                .lock()
+                .map_err(lock_error)?
+                .begin_subscription_login(params.provider_id)
+                .map_err(IpcError::from)?;
+            codex.send(CodexCommand::Login).map_err(codex_error)?;
+            backend
+                .lock()
+                .map(|state| state.snapshot())
+                .map_err(lock_error)
+        }),
+        "disconnectProvider" => parse::<ProviderParams>(request.params).and_then(|params| {
+            let subscription_logout = backend
+                .lock()
+                .map_err(lock_error)?
+                .snapshot()
+                .providers
+                .into_iter()
+                .find(|provider| provider.id == params.provider_id)
+                .is_some_and(|provider| {
+                    matches!(
+                        provider.status,
+                        chathead_core::ProviderStatus::Authenticated {
+                            method: chathead_core::AuthMethod::SubscriptionLogin
+                        }
+                    )
+                });
+            backend
+                .lock()
+                .map_err(lock_error)?
+                .disconnect_provider(params.provider_id)
+                .map_err(IpcError::from)?;
+            if subscription_logout {
+                codex.send(CodexCommand::Logout).map_err(codex_error)?;
             }
-            "stopOverlay" => {
-                overlay::stop_native_overlay(app);
-                presentation::stop();
-                let _ = codex.send(CodexCommand::NewChat);
-                backend.lock().map_err(lock_error).map(|mut state| {
-                    state.set_overlay_running(false);
-                    state.snapshot()
-                })
-            }
-            "setOverlayTheme" => parse::<OverlayThemeParams>(request.params).and_then(|params| {
-                overlay::set_native_overlay_theme(app, params.theme);
-                backend
-                    .lock()
-                    .map(|state| state.snapshot())
-                    .map_err(lock_error)
-            }),
-            "setPanelPosition" => parse::<PanelPositionParams>(request.params).and_then(|params| {
-                overlay::set_native_panel_position(params.position);
-                backend
-                    .lock()
-                    .map(|state| state.snapshot())
-                    .map_err(lock_error)
-            }),
-            "setPanelZoom" => parse::<PanelZoomParams>(request.params).and_then(|params| {
-                overlay::set_native_panel_zoom(params.zoom);
-                backend
-                    .lock()
-                    .map(|state| state.snapshot())
-                    .map_err(lock_error)
-            }),
-            "setPanelSize" => parse::<PanelSizeParams>(request.params).and_then(|params| {
-                overlay::set_native_panel_size(params.size);
-                backend
-                    .lock()
-                    .map(|state| state.snapshot())
-                    .map_err(lock_error)
-            }),
-            "refreshDesktopIntegration" => backend.lock().map_err(lock_error).map(|mut state| {
-                state.set_desktop_integration(desktop_integration::detect());
+            backend
+                .lock()
+                .map(|state| state.snapshot())
+                .map_err(lock_error)
+        }),
+        "launchOverlay" => {
+            launch_overlay(app, backend, codex, voice, output, shortcut_status_sender)
+        }
+        "stopOverlay" => {
+            overlay::stop_native_overlay(app);
+            presentation::stop();
+            let _ = codex.send(CodexCommand::NewChat);
+            backend.lock().map_err(lock_error).map(|mut state| {
+                state.set_overlay_running(false);
                 state.snapshot()
-            }),
-            "setVoiceEnabled" => parse::<VoiceEnabledParams>(request.params).and_then(|params| {
-                voice.set_enabled(params.enabled).map_err(voice_error)?;
+            })
+        }
+        "setOverlayTheme" => parse::<OverlayThemeParams>(request.params).and_then(|params| {
+            overlay::set_native_overlay_theme(app, params.theme);
+            backend
+                .lock()
+                .map(|state| state.snapshot())
+                .map_err(lock_error)
+        }),
+        "setPanelPosition" => parse::<PanelPositionParams>(request.params).and_then(|params| {
+            overlay::set_native_panel_position(params.position);
+            backend
+                .lock()
+                .map(|state| state.snapshot())
+                .map_err(lock_error)
+        }),
+        "setPanelZoom" => parse::<PanelZoomParams>(request.params).and_then(|params| {
+            overlay::set_native_panel_zoom(params.zoom);
+            backend
+                .lock()
+                .map(|state| state.snapshot())
+                .map_err(lock_error)
+        }),
+        "setPanelSize" => parse::<PanelSizeParams>(request.params).and_then(|params| {
+            overlay::set_native_panel_size(params.size);
+            backend
+                .lock()
+                .map(|state| state.snapshot())
+                .map_err(lock_error)
+        }),
+        "refreshDesktopIntegration" => backend.lock().map_err(lock_error).map(|mut state| {
+            state.set_desktop_integration(desktop_integration::detect());
+            state.snapshot()
+        }),
+        "setVoiceEnabled" => parse::<VoiceEnabledParams>(request.params).and_then(|params| {
+            voice.set_enabled(params.enabled).map_err(voice_error)?;
+            backend
+                .lock()
+                .map(|state| state.snapshot())
+                .map_err(lock_error)
+        }),
+        "setVoiceInputDevice" => {
+            parse::<VoiceInputDeviceParams>(request.params).and_then(|params| {
+                voice
+                    .set_input_device(params.device_id)
+                    .map_err(voice_error)?;
                 backend
                     .lock()
                     .map(|state| state.snapshot())
                     .map_err(lock_error)
-            }),
-            "setVoiceInputDevice" => {
-                parse::<VoiceInputDeviceParams>(request.params).and_then(|params| {
-                    voice
-                        .set_input_device(params.device_id)
-                        .map_err(voice_error)?;
-                    backend
-                        .lock()
-                        .map(|state| state.snapshot())
-                        .map_err(lock_error)
-                })
-            }
-            "setVoiceInteractionMode" => parse::<VoiceInteractionModeParams>(request.params)
-                .and_then(|params| {
-                    voice
-                        .set_interaction_mode(params.mode)
-                        .map_err(voice_error)?;
-                    backend
-                        .lock()
-                        .map(|state| state.snapshot())
-                        .map_err(lock_error)
-                }),
-            "setVoiceSubmissionMode" => parse::<VoiceSubmissionModeParams>(request.params)
-                .and_then(|params| {
-                    voice
-                        .set_submission_mode(params.mode)
-                        .map_err(voice_error)?;
-                    backend
-                        .lock()
-                        .map(|state| state.snapshot())
-                        .map_err(lock_error)
-                }),
-            "refreshVoiceDevices" => voice.refresh_devices().map_err(voice_error).and_then(|()| {
+            })
+        }
+        "setVoiceInteractionMode" => {
+            parse::<VoiceInteractionModeParams>(request.params).and_then(|params| {
+                voice
+                    .set_interaction_mode(params.mode)
+                    .map_err(voice_error)?;
                 backend
                     .lock()
                     .map(|state| state.snapshot())
                     .map_err(lock_error)
-            }),
-            "retryVoiceSetup" => voice.retry_setup().map_err(voice_error).and_then(|()| {
+            })
+        }
+        "setVoiceSubmissionMode" => {
+            parse::<VoiceSubmissionModeParams>(request.params).and_then(|params| {
+                voice
+                    .set_submission_mode(params.mode)
+                    .map_err(voice_error)?;
                 backend
                     .lock()
                     .map(|state| state.snapshot())
                     .map_err(lock_error)
-            }),
-            "setVoiceModel" => parse::<VoiceModelParams>(request.params).and_then(|params| {
-                voice.set_model(params.model_id).map_err(voice_error)?;
+            })
+        }
+        "refreshVoiceDevices" => voice.refresh_devices().map_err(voice_error).and_then(|()| {
+            backend
+                .lock()
+                .map(|state| state.snapshot())
+                .map_err(lock_error)
+        }),
+        "retryVoiceSetup" => voice.retry_setup().map_err(voice_error).and_then(|()| {
+            backend
+                .lock()
+                .map(|state| state.snapshot())
+                .map_err(lock_error)
+        }),
+        "setVoiceModel" => parse::<VoiceModelParams>(request.params).and_then(|params| {
+            voice.set_model(params.model_id).map_err(voice_error)?;
+            backend
+                .lock()
+                .map(|state| state.snapshot())
+                .map_err(lock_error)
+        }),
+        "downloadVoiceModel" => parse::<VoiceModelParams>(request.params).and_then(|params| {
+            voice.download_model(params.model_id).map_err(voice_error)?;
+            backend
+                .lock()
+                .map(|state| state.snapshot())
+                .map_err(lock_error)
+        }),
+        "cancelVoiceModelDownload" => {
+            parse::<VoiceModelParams>(request.params).and_then(|params| {
+                voice
+                    .cancel_model_download(params.model_id)
+                    .map_err(voice_error)?;
                 backend
                     .lock()
                     .map(|state| state.snapshot())
                     .map_err(lock_error)
-            }),
-            "downloadVoiceModel" => parse::<VoiceModelParams>(request.params).and_then(|params| {
-                voice.download_model(params.model_id).map_err(voice_error)?;
-                backend
-                    .lock()
-                    .map(|state| state.snapshot())
-                    .map_err(lock_error)
-            }),
-            "cancelVoiceModelDownload" => {
-                parse::<VoiceModelParams>(request.params).and_then(|params| {
-                    voice
-                        .cancel_model_download(params.model_id)
-                        .map_err(voice_error)?;
-                    backend
-                        .lock()
-                        .map(|state| state.snapshot())
-                        .map_err(lock_error)
-                })
-            }
-            "removeVoiceModel" => parse::<VoiceModelParams>(request.params).and_then(|params| {
-                voice.remove_model(params.model_id).map_err(voice_error)?;
-                backend
-                    .lock()
-                    .map(|state| state.snapshot())
-                    .map_err(lock_error)
-            }),
-            "startVoiceTest" => voice.start_test().map_err(voice_error).and_then(|()| {
-                backend
-                    .lock()
-                    .map(|state| state.snapshot())
-                    .map_err(lock_error)
-            }),
-            "stopVoiceTest" => voice.stop_test().map_err(voice_error).and_then(|()| {
-                backend
-                    .lock()
-                    .map(|state| state.snapshot())
-                    .map_err(lock_error)
-            }),
-            "shutdown" => {
-                overlay::stop_native_overlay(app);
-                presentation::stop();
-                let _ = codex.send(CodexCommand::Shutdown);
-                write_message(
-                    output,
-                    &IpcResponse::success(id, json!({ "shuttingDown": true })),
+            })
+        }
+        "removeVoiceModel" => parse::<VoiceModelParams>(request.params).and_then(|params| {
+            voice.remove_model(params.model_id).map_err(voice_error)?;
+            backend
+                .lock()
+                .map(|state| state.snapshot())
+                .map_err(lock_error)
+        }),
+        "startVoiceTest" => voice.start_test().map_err(voice_error).and_then(|()| {
+            backend
+                .lock()
+                .map(|state| state.snapshot())
+                .map_err(lock_error)
+        }),
+        "stopVoiceTest" => voice.stop_test().map_err(voice_error).and_then(|()| {
+            backend
+                .lock()
+                .map(|state| state.snapshot())
+                .map_err(lock_error)
+        }),
+        "beginShortcutCapture" => {
+            parse::<ShortcutActionParams>(request.params).and_then(|params| {
+                shortcuts
+                    .borrow_mut()
+                    .begin_capture(params.action)
+                    .map_err(shortcut_error)?;
+                if let Ok(mut state) = backend.lock() {
+                    state.set_shortcut_actions(shortcuts.borrow().states());
+                    state.set_shortcut_capture(shortcuts.borrow().capture());
+                }
+                let complete_shortcuts = shortcuts.clone();
+                let complete_backend = backend.clone();
+                let complete_output = output.clone();
+                let complete_service = shortcut_service.clone();
+                let cancel_shortcuts = shortcuts.clone();
+                let cancel_backend = backend.clone();
+                let cancel_output = output.clone();
+                let update_shortcuts = shortcuts.clone();
+                let update_backend = backend.clone();
+                let update_output = output.clone();
+                shortcut_integration::show_capture_surface(
+                    app,
+                    params.action,
+                    move |binding| {
+                        let _ = complete_shortcuts
+                            .borrow_mut()
+                            .captured(params.action, binding);
+                        configure_shortcut_service(&complete_shortcuts, &complete_service);
+                        publish_shortcuts(&complete_backend, &complete_shortcuts, &complete_output);
+                    },
+                    move || {
+                        cancel_shortcuts.borrow_mut().cancel_capture(params.action);
+                        publish_shortcuts(&cancel_backend, &cancel_shortcuts, &cancel_output);
+                    },
+                    move |pressed_keys| {
+                        update_shortcuts
+                            .borrow_mut()
+                            .update_capture_keys(params.action, pressed_keys);
+                        publish_shortcuts(&update_backend, &update_shortcuts, &update_output);
+                    },
                 );
-                app.quit();
-                return;
-            }
-            _ => Err(IpcError {
-                code: ErrorCode::UnsupportedOperation,
-                message: "unsupported IPC method".to_owned(),
-                recoverable: true,
-            }),
-        };
+                backend
+                    .lock()
+                    .map(|state| state.snapshot())
+                    .map_err(lock_error)
+            })
+        }
+        "cancelShortcutCapture" => {
+            parse::<ShortcutActionParams>(request.params).and_then(|params| {
+                shortcuts.borrow_mut().cancel_capture(params.action);
+                publish_shortcuts(backend, shortcuts, output);
+                backend
+                    .lock()
+                    .map(|state| state.snapshot())
+                    .map_err(lock_error)
+            })
+        }
+        "confirmShortcutReplacement" => {
+            parse::<ShortcutActionParams>(request.params).and_then(|params| {
+                shortcuts
+                    .borrow_mut()
+                    .confirm_replacement(params.action)
+                    .map_err(shortcut_error)?;
+                configure_shortcut_service(shortcuts, shortcut_service);
+                publish_shortcuts(backend, shortcuts, output);
+                backend
+                    .lock()
+                    .map(|state| state.snapshot())
+                    .map_err(lock_error)
+            })
+        }
+        "clearShortcut" => parse::<ShortcutActionParams>(request.params).and_then(|params| {
+            shortcuts
+                .borrow_mut()
+                .clear(params.action)
+                .map_err(shortcut_error)?;
+            configure_shortcut_service(shortcuts, shortcut_service);
+            publish_shortcuts(backend, shortcuts, output);
+            backend
+                .lock()
+                .map(|state| state.snapshot())
+                .map_err(lock_error)
+        }),
+        "repairShortcutIntegration" => {
+            let repair_result = {
+                let mut manager = shortcuts.borrow_mut();
+                manager.repair().map_err(shortcut_error)
+            };
+            repair_result.and_then(|()| {
+                configure_shortcut_service(shortcuts, shortcut_service);
+                publish_shortcuts(backend, shortcuts, output);
+                backend
+                    .lock()
+                    .map(|state| state.snapshot())
+                    .map_err(lock_error)
+            })
+        }
+        "shutdown" => {
+            overlay::stop_native_overlay(app);
+            presentation::stop();
+            let _ = codex.send(CodexCommand::Shutdown);
+            write_message(
+                output,
+                &IpcResponse::success(id, json!({ "shuttingDown": true })),
+            );
+            app.quit();
+            return;
+        }
+        _ => Err(IpcError {
+            code: ErrorCode::UnsupportedOperation,
+            message: "unsupported IPC method".to_owned(),
+            recoverable: true,
+        }),
+    };
 
     match result {
         Ok(snapshot) => {
@@ -750,6 +878,38 @@ fn lock_error<T>(_: std::sync::PoisonError<T>) -> IpcError {
     }
 }
 
+fn shortcut_error(message: String) -> IpcError {
+    IpcError {
+        code: ErrorCode::InvalidRequest,
+        message,
+        recoverable: true,
+    }
+}
+
+fn publish_shortcuts(
+    backend: &Arc<Mutex<Backend>>,
+    shortcuts: &Rc<RefCell<shortcut_integration::ShortcutManager>>,
+    output: &Output,
+) {
+    if let Ok(mut state) = backend.lock() {
+        state.set_shortcut_actions(shortcuts.borrow().states());
+        state.set_shortcut_integration(shortcuts.borrow().integration());
+        state.set_shortcut_capture(shortcuts.borrow().capture());
+        write_snapshot_changed(output, state.snapshot());
+    }
+}
+
+fn configure_shortcut_service(
+    shortcuts: &Rc<RefCell<shortcut_integration::ShortcutManager>>,
+    service: &overlay::ShortcutService,
+) {
+    let shortcuts = shortcuts.borrow();
+    service.configure(
+        shortcuts.configured_actions(),
+        shortcuts.integration().backend,
+    );
+}
+
 fn write_error(output: &Output, id: String, code: ErrorCode, message: String, recoverable: bool) {
     write_message(
         output,
@@ -805,6 +965,8 @@ mod tests {
     #[test]
     fn panel_zoom_parameters_reject_values_outside_the_protocol_levels() {
         assert!(parse::<PanelZoomParams>(json!({ "zoom": 125 })).is_ok());
+        assert!(parse::<PanelZoomParams>(json!({ "zoom": 250 })).is_ok());
+        assert!(parse::<PanelZoomParams>(json!({ "zoom": 251 })).is_err());
         assert!(parse::<PanelZoomParams>(json!({ "zoom": 95 })).is_err());
     }
 
@@ -817,7 +979,7 @@ mod tests {
             parse::<PanelSizeParams>(json!({ "size": { "width": 419, "height": 600 } })).is_err()
         );
         assert!(
-            parse::<PanelSizeParams>(json!({ "size": { "width": 720, "height": 801 } })).is_err()
+            parse::<PanelSizeParams>(json!({ "size": { "width": 720, "height": 851 } })).is_err()
         );
     }
 }
