@@ -11,7 +11,8 @@ voice, safe Markdown projections, links, clipboard content, and commands.
 - Hyprland/wlroots through GTK4 `wlr-layer-shell`, or Ubuntu 24.04 GNOME Shell
   46 Wayland through the bundled Shell extension
 - Ubuntu 24.04-compatible build environment
-- GTK 4.6 or newer and an XDG portal with GlobalShortcuts support
+- GTK 4.6 or newer; XDPH GlobalShortcuts is preferred on Hyprland, with native
+  Hyprland custom events as an unprivileged fallback
 - Rust 1.92 or newer, Node.js, and pnpm 11
 
 GNOME does not implement `wlr-layer-shell`. On GNOME 46, Settings offers an
@@ -86,7 +87,7 @@ chathead-ai
 
 ## Security and IPC
 
-The sidecar speaks newline-delimited JSON protocol version 11 over stdin/stdout.
+The sidecar speaks newline-delimited JSON protocol version 12 over stdin/stdout.
 Stdout is reserved for protocol messages; diagnostics use stderr. Snapshots
 contain provider status and overlay state but never credential values.
 
@@ -140,21 +141,50 @@ checksum-verified Whisper Tiny multilingual INT8 and Qwen3-ASR 0.6B INT8
 models. Whisper remains the fresh-install selection until the documented
 English/Filipino/code-switching accuracy and hardware performance gates have
 been completed; Qwen can already be downloaded and activated explicitly.
-Hold `Super+E` to capture and release it to transcribe; Toggle mode
-is available for portals that do not reliably deliver release events. English,
+Voice input has no global shortcut on a fresh install. Configure one under
+Keyboard Shortcuts; Hold mode captures on press and transcribes on release,
+while Toggle mode changes state on activation and ignores release. English,
 Filipino/Tagalog, and common code-switching are recognized locally. The final
 transcript enters the existing composer and sends after a fixed 0.7-second Esc
 cancellation window.
 
-Press `Super+W` to toggle the chat panel without changing voice capture or an
-in-progress chat response. The companion orb remains available while the panel
-is hidden.
+Panel visibility likewise has no reserved shortcut until the user configures
+one. A configured panel shortcut can launch the overlay from the tray process
+when provider and desktop readiness pass; otherwise Settings shows the exact
+readiness blocker. The companion orb remains available while the panel is hidden.
+
+On an actively verified Hyprland session, ChatHead stores its approved shortcut
+state in `$XDG_CONFIG_HOME/chathead-ai/shortcuts.json` and generates one managed
+fragment under `$XDG_CONFIG_HOME/hypr/chathead-ai`. Hyprland 0.55+ uses Lua;
+0.54 and earlier use an isolated legacy hyprlang adapter. Existing bindings are
+only shadowed after an explicit warning and their original configuration lines
+are never edited, so clearing the ChatHead shortcut restores them naturally.
+No root access or `/dev/input` access is used. Replacement cannot override
+kernel, TTY, secure-attention, or hardware-reserved sequences, and ChatHead must
+be running for its actions to activate.
 
 Capture uses the native Rust sidecar through PipeWire, PulseAudio, or ALSA. Raw
 audio stays in bounded memory, is never saved, is never sent through Electron
 IPC, and is never uploaded. Recording auto-finalizes after 30 seconds.
 No-speech recordings, device loss, overflow, empty transcripts, and busy-chat
 attempts are discarded without sending a prompt.
+
+## Experimental native Agent mode
+
+The native GTK panel can switch a session from safe Chat to experimental Agent
+mode. Agent requires a folder selected through the XDG desktop portal and runs
+Codex App Server turns in that folder with `approvalPolicy: "never"` and
+`dangerFullAccess`. It can read, edit, delete, run commands, and use the network
+with the launching user's privileges. Cached or passwordless `sudo` can allow
+elevation without another prompt.
+
+The full-access acknowledgment is the only Agent value persisted, under the
+ChatHead XDG configuration directory. Conversation text, activity details,
+questions, selected folders, and Codex thread ids remain in memory for the
+running session. New Chat always returns to safe Chat mode. The GNOME Shell
+presentation remains Chat-only in this release; Agent controls and activity are
+available only in the native GTK panel. Codex App Server and interactive user
+input requests are experimental, so this capability is not production-stable.
 
 Private local comparisons use a tab-separated manifest whose rows contain an
 absolute mono-WAV path and reference transcript. Audio remains outside git:

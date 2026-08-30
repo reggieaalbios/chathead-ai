@@ -27,8 +27,12 @@ The renderer is sandboxed, uses context isolation, has no Node integration, and 
 | `gtk4-layer-shell` | `chathead-linux` | Creates a click-through `wlr-layer-shell` overlay on supported Wayland compositors. |
 | GNOME Shell 46 ES modules + `St`/`Clutter` | `gnome-extension/` | Creates compositor-owned orb/panel actors on Ubuntu 24.04 GNOME Wayland without XWayland or window-list manipulation. |
 | GDBus presentation protocol 1 | `presentation.rs` | Publishes revisioned renderer-neutral snapshots and typed actions while keeping parsing, links, copy payloads, providers, and voice in Rust. |
-| ashpd GlobalShortcuts | `overlay.rs` | Registers `Super+E` for voice and `Super+W` for panel visibility through the XDG portal, consuming Activated and Deactivated events. |
-| Tokio + `futures-util` | shortcut thread | Runs portal registration and both event streams away from GTK. |
+| ashpd GlobalShortcuts | `overlay.rs` | Registers only user-configured logical actions without preferred physical triggers, consuming Activated and Deactivated events. |
+| Hyprland Lua / legacy adapter | `shortcut_integration.rs` | Detects the active instance, persists approved bindings, and generates a reversible Lua fragment for 0.55+ or isolated hyprlang fragment for 0.54 and earlier. |
+| GTK shortcut inhibition | `shortcut_integration.rs` | Requests focused compositor shortcut inhibition for a native key-capture surface without root or raw input access. |
+| Tokio + `futures-util` | shortcut thread | Reconfigures portal or native-event listeners and reconnects after portal or IPC restarts away from GTK. |
+| Codex App Server JSONL | native GTK Chat and Agent | Keeps ephemeral in-memory threads, forks visible context across mode/folder changes, and streams bounded command, file, MCP, web, and unknown activity cards. Agent uses a portal-selected local `cwd`, no approvals, and full access. |
+| ashpd FileChooser | native GTK Agent | Selects local Agent directories through the XDG portal without deprecated GTK file chooser APIs. |
 | Linux Secret Service via `keyring` | `chathead-core` | Stores provider API keys without putting secrets in IPC or plaintext configuration. |
 
 The overlay targets Linux x86_64 Wayland. Hyprland/wlroots uses the existing GTK layer surface; GNOME Shell 46 uses the bundled Shell extension. Unsupported compositors and GNOME Xorg retain Settings but cannot launch. There is no XWayland or compositor-polling fallback.
